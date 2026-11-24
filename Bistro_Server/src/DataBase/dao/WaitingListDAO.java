@@ -23,7 +23,7 @@ import common.dto.WaitingListDTO;
 public class WaitingListDAO {
 
     // =============================================================
-    // 1. METHODS FROM HEAD (Your Dashboard Logic)
+    // 1. DASHBOARD METHODS
     // =============================================================
 	/**
 	 * Inserts a new waiting-list entry.
@@ -68,39 +68,171 @@ public class WaitingListDAO {
      *
      * @return list of waiting-list DTOs
      */
-    public static List<WaitingListDTO> getAllWaitingList() {
+    public static List<WaitingListDTO> getAllWaitingList() throws Exception {
         List<WaitingListDTO> list = new ArrayList<>();
 
         String sql = "SELECT waiting_id, num_of_customers, request_time, status, confirmation_code FROM waiting_list WHERE status IN ('WAITING', 'ASSIGNED') ORDER BY request_time ASC";
 
-        try {
-            MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-            PooledConnection pc = pool.getConnection();
-            Connection conn = pc.getConnection();
-            PreparedStatement ps = conn.prepareStatement(sql);
-            ResultSet rs = ps.executeQuery();
+        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
+        PooledConnection pc = pool.getConnection();
+        Connection conn = pc.getConnection();
+
+        // try-with-resources + finally: the statement/result set are always closed and the
+        // connection always goes back to the pool (before, an exception leaked all three).
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
 
             while (rs.next()) {
                 int id = rs.getInt("waiting_id");
                 int count = rs.getInt("num_of_customers");
                 String status = rs.getString("status");
                 String code = rs.getString("confirmation_code");
-                
+
                 java.sql.Timestamp ts = rs.getTimestamp("request_time");
                 String timeStr = (ts != null) ? ts.toString() : "";
 
                 list.add(new WaitingListDTO(id, count, timeStr, status, code));
             }
-
+        } finally {
             pool.releaseConnection(pc);
-        } catch (Exception e) {
-            e.printStackTrace();
         }
         return list;
     }
 
+    /** Result of joining the waiting list. */
+    public static final class JoinResult {
+        /** waiting_id of the new entry (its confirmation code is also used to pay the bill). */
+        public final int waitingId;
+        /** Table the customer was sent to right away, or null if they are now waiting. */
+        public final String seatedTableId;
+
+        JoinResult(int waitingId, String seatedTableId) {
+            this.waitingId = waitingId;
+            this.seatedTableId = seatedTableId;
+        }
+    }
+
+    /**
+     * Joins the waiting list in ONE transaction: inserts the entry and its user_activity row
+     * (so an entry never exists without contact details), then - as the spec requires - if a
+     * suitable table is free right now, sends the customer straight to it instead of waiting.
+     *
+     * @param numOfCustomers     party size
+     * @param requestTime        request time
+     * @param confirmationCode   unique waiting code
+     * @param subscriberUsername subscriber username, or null for a guest
+     * @param guestEmail         guest email (null for subscribers)
+     * @param guestPhone         guest phone (null for subscribers)
+     * @return the new waiting_id, and the table if the customer was seated immediately
+     * @throws java.sql.SQLIntegrityConstraintViolationException if the code already exists
+     * @throws Exception on other database errors
+     */
+    public static JoinResult insertWaitingWithActivity(int numOfCustomers, Timestamp requestTime, String confirmationCode,
+                                                       String subscriberUsername, String guestEmail, String guestPhone)
+            throws Exception {
+
+        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
+        PooledConnection pc = pool.getConnection();
+        Connection conn = pc.getConnection();
+
+        try {
+            conn.setAutoCommit(false);
+
+            int waitingId;
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    INSERT INTO waiting_list (num_of_customers, request_time, status, confirmation_code)
+                    VALUES (?, ?, 'WAITING', ?)
+                """, java.sql.Statement.RETURN_GENERATED_KEYS)) {
+                ps.setInt(1, numOfCustomers);
+                ps.setTimestamp(2, requestTime);
+                ps.setString(3, confirmationCode);
+                ps.executeUpdate();
+                try (ResultSet rs = ps.getGeneratedKeys()) {
+                    if (!rs.next()) throw new java.sql.SQLException("No waiting_id generated.");
+                    waitingId = rs.getInt(1);
+                }
+            }
+
+            int activityId = UserActivityDAO.insertActivity(conn, subscriberUsername, guestPhone, guestEmail,
+                    null, waitingId, requestTime);
+
+            String tableId = (activityId > 0) ? trySeatImmediately(conn, waitingId, numOfCustomers, activityId) : null;
+
+            conn.commit();
+            return new JoinResult(waitingId, tableId);
+
+        } catch (Exception e) {
+            try { conn.rollback(); } catch (Exception ignored) {}
+            throw e;
+        } finally {
+            try { conn.setAutoCommit(true); } catch (Exception ignored) {}
+            pool.releaseConnection(pc);
+        }
+    }
+
+    /**
+     * Spec: "if a table is available immediately, the customer is sent to the table right away,
+     * instead of the notification and without entering the waiting list".
+     * <p>
+     * Takes the smallest free table that fits, but only if:
+     * <ul>
+     *   <li>nobody who joined earlier and fits that table is still waiting (they keep their turn), and</li>
+     *   <li>the table is not needed by reservations due in the next 2 hours.</li>
+     * </ul>
+     * On success the table is OCCUPIED, a visit is started and the entry is ARRIVED.
+     * Otherwise nothing changes (savepoint) and the customer stays WAITING.
+     *
+     * @return the table id, or null if the customer must wait
+     */
+    private static String trySeatImmediately(Connection conn, int waitingId, int people, int activityId) throws Exception {
+        Savepoint sp = conn.setSavepoint("SEAT_NOW");
+
+        String tableId = RestaurantTableDAO.reserveFreeTableForWaitingReturnTableId(conn, waitingId, people);
+        if (tableId == null) { conn.rollback(sp); return null; }
+
+        int tableSeats = 0;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT num_of_seats FROM restaurant_table WHERE table_id = ?")) {
+            ps.setString(1, tableId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) tableSeats = rs.getInt(1);
+            }
+        }
+
+        // Earlier customers who fit this table keep their place in line
+        try (PreparedStatement ps = conn.prepareStatement("""
+                SELECT 1 FROM waiting_list
+                WHERE status = 'WAITING' AND waiting_id <> ? AND num_of_customers <= ?
+                LIMIT 1
+            """)) {
+            ps.setInt(1, waitingId);
+            ps.setInt(2, tableSeats);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) { conn.rollback(sp); return null; }
+            }
+        }
+
+        // Don't take a table that reservations due soon will need
+        if (!RestaurantTableDAO.canSeatUpcomingReservationsFromFreeTables(conn, 120, 20)) {
+            conn.rollback(sp);
+            return null;
+        }
+
+        if (RestaurantTableDAO.occupyReservedTablesForWaiting(conn, waitingId) <= 0) {
+            conn.rollback(sp);
+            return null;
+        }
+        VisitDAO.insertVisit(conn, activityId, tableId);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE waiting_list SET status = 'ARRIVED' WHERE waiting_id = ?")) {
+            ps.setInt(1, waitingId);
+            ps.executeUpdate();
+        }
+        return tableId;
+    }
+
     // =============================================================
-    // 2. METHODS FROM MAIN (The Complex Logic)
+    // 2. TERMINAL / ASSIGNMENT LOGIC
     // =============================================================
     /**
      * Retrieves a waiting-list entry by confirmation code.
@@ -133,33 +265,6 @@ public class WaitingListDAO {
                 dto.setConfirmationCode(rs.getString("confirmation_code"));
                 return dto;
             }
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
-    /**
-     * Updates waiting-list status by confirmation code.
-     *
-     * @param code confirmation code
-     * @param newStatus new status value
-     * @return true if updated, false otherwise
-     * @throws Exception on database error
-     */
-    public static boolean updateStatusByCode(String code, String newStatus) throws Exception {
-        String sql = """
-            UPDATE waiting_list
-            SET status = ?
-            WHERE confirmation_code = ?
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, newStatus);
-            ps.setString(2, code);
-            return ps.executeUpdate() > 0;
         } finally {
             pool.releaseConnection(pc);
         }
@@ -217,92 +322,7 @@ public class WaitingListDAO {
         }
     }
 
-    public static String getGuestEmailForWaitingId(int waitingId) throws Exception {
-        String sql = """
-            SELECT guest_email
-            FROM user_activity
-            WHERE waiting_id = ?
-            ORDER BY activity_id DESC
-            LIMIT 1
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, waitingId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
-            }
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
     
-    public static String getGuestPhoneForWaitingId(int waitingId) throws Exception {
-        String sql = """
-            SELECT guest_phone
-            FROM user_activity
-            WHERE waiting_id = ?
-            ORDER BY activity_id DESC
-            LIMIT 1
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, waitingId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
-            }
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
-    /**
-     * Inserts a waiting-list entry and returns its generated ID.
-     *
-     * @param numOfCustomers number of customers
-     * @param requestTime request timestamp
-     * @param status initial status
-     * @param confirmationCode confirmation code
-     * @return generated waiting_id or -1 if failed
-     * @throws Exception on database error
-     */
-    public static int insertWaitingReturnId(
-            int numOfCustomers,
-            Timestamp requestTime,
-            String status,
-            String confirmationCode) throws Exception {
-
-        String sql = """
-            INSERT INTO waiting_list
-            (num_of_customers, request_time, status, confirmation_code)
-            VALUES (?, ?, ?, ?)
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql, java.sql.Statement.RETURN_GENERATED_KEYS)) {
-            ps.setInt(1, numOfCustomers);
-            ps.setTimestamp(2, requestTime);
-            ps.setString(3, status);
-            ps.setString(4, confirmationCode);
-            ps.executeUpdate();
-
-            try (ResultSet rs = ps.getGeneratedKeys()) {
-                if (rs.next()) return rs.getInt(1);
-            }
-            return -1;
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
     /**
      * Cancels waiting-list entries that exceeded a given age.
      *
@@ -530,12 +550,8 @@ public class WaitingListDAO {
                 return null;
             }
 
-            int pendingNeed = ReservationDAO.sumPendingSeats(conn, 20);
-            int confirmedNeed = ReservationDAO.sumConfirmedDueSoonSeats(conn, RESERVATION_LOOKAHEAD_MINUTES);
-            int pendingReservedSeats = RestaurantTableDAO.sumReservedSeatsForPendingReservations(conn);
-
-            int effectivePendingNeed = Math.max(0, pendingNeed - pendingReservedSeats);
-            int protectedNeed = effectivePendingNeed + confirmedNeed;
+            // Upcoming reservations are protected below by canSeatUpcomingReservationsFromFreeTables().
+            // PENDING reservations are handled before this method by autoReserveForPendingReservations().
 
             String pick = """
                 SELECT waiting_id, num_of_customers, confirmation_code
@@ -842,4 +858,4 @@ public class WaitingListDAO {
         }
     }
 
-}
+}

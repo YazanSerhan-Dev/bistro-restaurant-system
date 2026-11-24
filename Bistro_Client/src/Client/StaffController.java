@@ -245,7 +245,14 @@ public class StaffController implements ClientUI {
     public void handleServerMessage(Object msg) {
         Platform.runLater(() -> {
             Envelope env = unwrapToEnvelope(msg);
-            if (env == null || !env.isOk()) return;
+            if (env == null) return;
+
+            // Server-side failures (validation, access denied, DB errors) must be visible to staff
+            if (!env.isOk()) {
+                String err = env.getMessage();
+                showAlert("Error", (err == null || err.isBlank()) ? "The server could not complete the request." : err);
+                return;
+            }
 
             switch (env.getOp()) {
                 // --- Lists Updates ---
@@ -274,20 +281,29 @@ public class StaffController implements ClientUI {
                 case RESPONSE_SUBSCRIBERS_LIST        -> updateSubscribersTable((List<?>) env.getPayload());
                 
                 case RESPONSE_WAITING_LIST -> {
+                    if (env.getPayload() instanceof List<?> list) updateWaitingListTable(list);
+                }
+                case RESPONSE_WAITING_ADD -> {
                     Object p = env.getPayload();
-                    if (p instanceof List) {
-                        updateWaitingListTable((List<?>) p);
-                    } else if (p instanceof String errorMSG) {
-                        // ✅ NEW: If we receive a String, it's an error/status message -> Show Popup
-                        showAlert("Info", errorMSG);
-                        // Then refresh the list to be safe
-                        sendToServer(Envelope.request(OpCode.REQUEST_WAITING_LIST, null));
-                    } else {
-                        sendToServer(Envelope.request(OpCode.REQUEST_WAITING_LIST, null));
+                    if (p instanceof WaitingListDTO dto && dto.getTableId() != null && !dto.getTableId().isBlank()) {
+                        // A table was free: the customer is seated right away (spec)
+                        showAlert("Table Available",
+                                "Seat the customer at table " + dto.getTableId() + " now."
+                                + "\nCode (for the bill): " + dto.getConfirmationCode()
+                                + "\nPeople: " + dto.getPeopleCount());
+                    } else if (p instanceof WaitingListDTO dto) {
+                        // The walk-in needs this code to check in later -> show it to the staff member
+                        showAlert("Added to Waiting List",
+                                "Waiting code: " + dto.getConfirmationCode()
+                                + "\nPeople: " + dto.getPeopleCount()
+                                + "\n\nGive this code to the customer (it was also sent by email/SMS if provided).");
+                    } else if (p != null) {
+                        showAlert("Info", p.toString());
                     }
-                } 
-                case RESPONSE_WAITING_ADD, 
-                RESPONSE_WAITING_REMOVE -> handleWaitingListUpdateResponse((String) env.getPayload());
+                    sendToServer(Envelope.request(OpCode.REQUEST_WAITING_LIST, null));
+                }
+                case RESPONSE_WAITING_REMOVE -> handleWaitingListUpdateResponse(
+                        env.getPayload() == null ? null : env.getPayload().toString());
 
                 
                 case RESPONSE_CURRENT_DINERS          -> updateCurrentDinersTable((List<?>) env.getPayload());
@@ -298,6 +314,7 @@ public class StaffController implements ClientUI {
                 // --- Single Updates / Actions ---
                 case RESPONSE_REGISTER_CUSTOMER -> showAlert("Success", "Customer registered successfully.");
                 case RESPONSE_TODAY_HOURS       -> updateTodayHours((String) env.getPayload());
+                case RESPONSE_GET_AVAILABLE_TIMES -> handleAvailableTimesForDialog(env.getPayload());
                 case RESPONSE_LOGIN_SUBSCRIBER  -> handleSubscriberLoginResponse((LoginResponseDTO) env.getPayload());
 
                
@@ -661,6 +678,7 @@ public class StaffController implements ClientUI {
      */
     @FXML
     private void onLogout(ActionEvent event) {
+        ClientSession.clearAllIdentity(); // the login screen also resets the server-side session
         SceneManager.showLogin();
     }
 
@@ -1018,6 +1036,45 @@ public class StaffController implements ClientUI {
         colStatus.setCellValueFactory(new PropertyValueFactory<>("status"));
 
         tblRestaurantTables.getColumns().addAll(colId, colSeats, colStatus);
+
+        // Selecting a table fills the inputs, so its seat count can be changed with "Update Seats"
+        tblRestaurantTables.getSelectionModel().selectedItemProperty().addListener((obs, oldV, t) -> {
+            if (t == null) {
+                tfTableId.clear();
+                return;
+            }
+            tfTableId.setText(t.getTableId());
+            tfTableSeats.setText(String.valueOf(t.getSeats()));
+        });
+    }
+
+    /**
+     * Changes the number of seats of the selected table (spec: add, delete, change seats).
+     * The server refuses if the table is in use or existing reservations would no longer fit.
+     *
+     * @param event button click event
+     */
+    @FXML
+    private void onUpdateTableSeats(ActionEvent event) {
+        RestaurantTableDTO selected = tblRestaurantTables.getSelectionModel().getSelectedItem();
+        if (selected == null) {
+            showAlert("Selection Error", "Select a table in the list first.");
+            return;
+        }
+        int seats;
+        try {
+            seats = Integer.parseInt(tfTableSeats.getText().trim());
+            if (seats <= 0) throw new NumberFormatException();
+        } catch (Exception e) {
+            showAlert("Error", "Seats must be a valid positive number.");
+            return;
+        }
+        if (seats == selected.getSeats()) {
+            showAlert("Info", "Table " + selected.getTableId() + " already has " + seats + " seats.");
+            return;
+        }
+        sendToServer(Envelope.request(OpCode.REQUEST_TABLE_UPDATE,
+                new RestaurantTableDTO(selected.getTableId(), seats, selected.getStatus())));
     }
     /**
      * Initializes the opening hours tables for regular weekly hours and special dates (only once).
@@ -1254,14 +1311,27 @@ public class StaffController implements ClientUI {
 
         DatePicker dpDate = new DatePicker(java.time.LocalDate.now());
         ComboBox<String> cbTime = new ComboBox<>();
-        
-        for (int h = 0; h < 24; h++) {
-            cbTime.getItems().add(String.format("%02d:00", h));
-            cbTime.getItems().add(String.format("%02d:30", h));
-        }
-        cbTime.getSelectionModel().select("19:00");
+        cbTime.setPromptText("Enter party size first");
 
         TextField tfSize = new TextField(); tfSize.setPromptText("Ex: 4");
+
+        // Spec: only times when the restaurant is open AND has room -> ask the server for (date, size)
+        dialogTimeCombo = cbTime;
+        Runnable reloadTimes = () -> {
+            cbTime.getItems().clear();
+            cbTime.setValue(null);
+            int size;
+            try { size = Integer.parseInt(tfSize.getText().trim()); } catch (Exception ex) { size = 0; }
+            if (dpDate.getValue() == null || size <= 0) {
+                cbTime.setPromptText("Enter party size first");
+                return;
+            }
+            cbTime.setPromptText("Loading times...");
+            sendToServer(Envelope.request(OpCode.REQUEST_GET_AVAILABLE_TIMES,
+                    new Object[] { dpDate.getValue().toString(), size }));
+        };
+        dpDate.valueProperty().addListener((o, a, b) -> reloadTimes.run());
+        tfSize.textProperty().addListener((o, a, b) -> reloadTimes.run());
         CheckBox chkSubscriber = new CheckBox("Is Subscriber?");
         
         TextField tfSubId = new TextField(); tfSubId.setPromptText("Subscriber ID");
@@ -1315,6 +1385,11 @@ public class StaffController implements ClientUI {
             } catch (Exception ex) {
                 showAlert("Invalid Input", "Party size must be a number > 0.");
                 ae.consume();
+                return;
+            }
+            if (dpDate.getValue() == null || cbTime.getValue() == null) {
+                showAlert("Invalid Input", "Please choose a date and one of the available times.");
+                ae.consume();
             }
         });
 
@@ -1338,9 +1413,24 @@ public class StaffController implements ClientUI {
             return null;
         });
 
-        dialog.showAndWait().ifPresent(dto -> {
-            sendToServer(Envelope.request(OpCode.REQUEST_MAKE_RESERVATION, dto));
-        });
+        var result = dialog.showAndWait();
+        dialogTimeCombo = null; // dialog closed: stop routing time lists to it
+        result.ifPresent(dto -> sendToServer(Envelope.request(OpCode.REQUEST_MAKE_RESERVATION, dto)));
+    }
+
+    /** Time combo of the open "Add Reservation" dialog (null when no dialog is open). */
+    private ComboBox<String> dialogTimeCombo;
+
+    /** Fills the open dialog's time list with the bookable times sent by the server. */
+    private void handleAvailableTimesForDialog(Object payload) {
+        ComboBox<String> cb = dialogTimeCombo;
+        if (cb == null) return;
+        cb.getItems().clear();
+        if (payload instanceof List<?> list) {
+            for (Object o : list) if (o != null) cb.getItems().add(o.toString());
+        }
+        cb.setPromptText(cb.getItems().isEmpty() ? "No available times" : "Select time");
+        if (!cb.getItems().isEmpty()) cb.getSelectionModel().selectFirst();
     }
     /**
      * Cancels the selected reservation after confirmation.
@@ -1465,9 +1555,14 @@ public class StaffController implements ClientUI {
         paneOpeningHours.setVisible(true);
         paneOpeningHours.setManaged(true);
         
-        // Change: Call the new UI setup method
         setupOpeningHoursTables();
-        
+
+        // Explain the "closed day" convention right in the inputs
+        if (tfSpecialOpen != null) tfSpecialOpen.setPromptText("Open HH:mm (00:00 = closed)");
+        if (tfSpecialClose != null) tfSpecialClose.setPromptText("Close HH:mm (00:00 = closed)");
+        if (tfRegularOpen != null) tfRegularOpen.setPromptText("Open HH:mm");
+        if (tfRegularClose != null) tfRegularClose.setPromptText("Close HH:mm");
+
         sendToServer(Envelope.request(OpCode.REQUEST_OPENING_HOURS_GET, null));
     }
 
@@ -1491,17 +1586,20 @@ public class StaffController implements ClientUI {
         String newOpen = tfRegularOpen.getText().trim();
         String newClose = tfRegularClose.getText().trim();
         
-        if (newOpen.isEmpty() || newClose.isEmpty()) {
-            showAlert("Error", "Times cannot be empty.");
+        if (!isValidTime(newOpen) || !isValidTime(newClose)) {
+            showAlert("Error", "Times must be HH:mm (e.g. 09:00). Use the same time twice (00:00 / 00:00) to mark the day closed.");
             return;
         }
 
-        // 2. Update DTO
-        selected.setOpenTime(newOpen);
-        selected.setCloseTime(newClose);
-        
-        // 3. Send to Server
-        sendToServer(Envelope.request(OpCode.REQUEST_OPENING_HOURS_UPDATE, selected));
+        // 2. Send a COPY: the table row is only updated after the server confirms (refresh on success)
+        OpeningHoursDTO update = new OpeningHoursDTO(selected.getHoursId(), selected.getDayOfWeek(),
+                newOpen, newClose, false, null);
+        sendToServer(Envelope.request(OpCode.REQUEST_OPENING_HOURS_UPDATE, update));
+    }
+
+    /** Accepts H:mm, HH:mm or HH:mm:ss (the server does the full open/close validation). */
+    private static boolean isValidTime(String t) {
+        return t != null && t.trim().matches("^([01]?\\d|2[0-3]):[0-5]\\d(:[0-5]\\d)?$");
     }
 
     // 3. Button: Add Special Date Exception
@@ -1522,9 +1620,9 @@ public class StaffController implements ClientUI {
         String open = tfSpecialOpen.getText().trim();
         String close = tfSpecialClose.getText().trim();
         
-        if (open.isEmpty() || close.isEmpty()) { 
-            showAlert("Error", "Please enter open and close times."); 
-            return; 
+        if (!isValidTime(open) || !isValidTime(close)) {
+            showAlert("Error", "Times must be HH:mm (e.g. 09:00). Use the same time twice (00:00 / 00:00) to mark the date closed.");
+            return;
         }
 
         // Create new DTO for special date
@@ -1582,29 +1680,6 @@ public class StaffController implements ClientUI {
         populateActivityChart(data);
     }
     /**
-     * Legacy/alternate waiting list handler.
-     * <p>
-     * Supports both list payload (refresh table) and string payload (message + refresh).
-     * </p>
-     *
-     * @param payload either a {@link List} of waiting list entries or a server message string
-     */
-    private void handleWaitingListResponse(Object payload) {
-        if (payload instanceof List) {
-            // Normal update: payload is the list of rows
-            updateWaitingListTable((List<?>) payload);
-        } else if (payload instanceof String msg) {
-            // "Add" success/error message: show alert & refresh table
-            Platform.runLater(() -> {
-                Alert alert = new Alert(Alert.AlertType.INFORMATION);
-                alert.setContentText(msg);
-                alert.show();
-            });
-            // Refresh the list immediately so the new person appears
-            sendToServer(Envelope.request(OpCode.REQUEST_WAITING_LIST, null));
-        }
-    }
-    /**
      * Handles a subscriber login response within staff context.
      * On success, sets session role/username and navigates to customer main view.
      *
@@ -1614,6 +1689,8 @@ public class StaffController implements ClientUI {
         if (res.isOk()) {
             ClientSession.setRole("SUBSCRIBER");
             ClientSession.setUsername(res.getUsername());
+            // Needed by the Profile page (it was missing, so "act as subscriber" broke the profile)
+            ClientSession.setMemberCode(res.getMemberCode());
             SceneManager.showCustomerMain();
         } else {
             showAlert("Validation Failed", res.getMessage());

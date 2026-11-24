@@ -127,7 +127,8 @@
                                <TextField fx:id="tfTableId" promptText="e.g. T11" prefWidth="80"/>
                                <Label text="Seats:"/>
                                <TextField fx:id="tfTableSeats" promptText="e.g. 4" prefWidth="60"/>
-                               <Button text="Add / Update" onAction="#onAddTable" style="-fx-background-color: #27ae60; -fx-text-fill: white;"/>
+                               <Button text="Add Table" onAction="#onAddTable" style="-fx-background-color: #27ae60; -fx-text-fill: white;"/>
+                               <Button text="Update Seats" onAction="#onUpdateTableSeats" style="-fx-background-color: #2980b9; -fx-text-fill: white;"/>
                                <Button text="Delete Selected" onAction="#onDeleteTable" style="-fx-background-color: #c0392b; -fx-text-fill: white;"/>
                            </children>
                         </HBox>

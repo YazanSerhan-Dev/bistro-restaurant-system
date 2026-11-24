@@ -9,7 +9,7 @@ package common;
  * action and the expected response type.
  * </p>
  *
- * <h3>Naming Convention</h3>
+ * <b>Naming Convention</b>
  * <ul>
  *   <li><b>REQUEST_*</b> - Sent from client to server to ask for an operation.</li>
  *   <li><b>RESPONSE_*</b> - Sent from server to client as a reply to a request.</li>
@@ -157,6 +157,11 @@ public enum OpCode {
     REQUEST_REPORT_ACTIVITY,
     RESPONSE_REPORT_ACTIVITY,
     
-    REQUEST_PERFORMANCE_LOGS,  
+    REQUEST_PERFORMANCE_LOGS,
     RESPONSE_PERFORMANCE_LOGS,
+
+ // ===== Session =====
+    // Appended at the end on purpose: Kryo sends enums by ordinal, so new
+    // constants must always be added last (and identically in client + server).
+    REQUEST_LOGOUT,
 }

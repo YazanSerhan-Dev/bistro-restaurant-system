@@ -56,9 +56,17 @@ public class TerminalEntryController implements ClientUI {
      */
     @FXML
     private void onCustomer() {
-        // Clear any subscriber identity
-        ClientSession.setRole("CUSTOMER");
-        ClientSession.setUsername("");
+        // Clear any subscriber identity (locally AND on the server connection)
+        ClientSession.clearAllIdentity();
+        try {
+            BistroClient c = ClientSession.getClient();
+            if (c != null && c.isConnected()) {
+                c.sendToServer(new KryoMessage("ENVELOPE",
+                        KryoUtil.toBytes(Envelope.request(OpCode.REQUEST_LOGOUT, null))));
+            }
+        } catch (Exception ignored) {
+            // not fatal: customer-mode actions don't depend on a subscriber session
+        }
         SceneManager.showTerminal(false);
     }
       

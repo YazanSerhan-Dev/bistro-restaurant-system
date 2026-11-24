@@ -14,6 +14,7 @@ import common.KryoUtil;
 import common.OpCode;
 import common.dto.MakeReservationResponseDTO;
 import common.dto.ProfileDTO;
+import common.dto.ReservationDTO;
 import common.dto.WaitingListDTO;
 import common.dto.MakeReservationRequestDTO;
 
@@ -22,7 +23,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 
-import java.lang.reflect.Method;
 import java.util.List;
 /**
  * JavaFX controller for the Bistro client application.
@@ -93,6 +93,9 @@ public class ClientController implements ClientUI {
 
     @FXML private TableView<ReservationRow> tblHistory;
     private final ObservableList<ReservationRow> history = FXCollections.observableArrayList();
+
+    /** Subscriber's past visits (spec: subscribers see their reservations AND visits history). */
+    @FXML private ListView<String> lvVisits;
     
     private boolean isSubscriber;
 
@@ -103,6 +106,9 @@ public class ClientController implements ClientUI {
 
     // ✅ Pending reservation base (after availability check)
     private MakeReservationRequestDTO pendingReservationBase;
+
+    /** Time ("HH:mm") to select once the time list for a new date arrives (clicked alternative). */
+    private String pendingTimeToSelect;
 
     /**
      * Initializes the controller after FXML loading.
@@ -148,6 +154,14 @@ public class ClientController implements ClientUI {
             dpReservationDate.setValue(LocalDate.now());
 
             dpReservationDate.valueProperty().addListener((obs, oldV, newV) -> {
+                hideSuggestedTimesUI();
+                requestAvailableTimesForSelectedDate();
+            });
+        }
+
+        // Available times depend on the party size too -> reload when it changes
+        if (txtNumCustomers != null) {
+            txtNumCustomers.textProperty().addListener((obs, oldV, newV) -> {
                 hideSuggestedTimesUI();
                 requestAvailableTimesForSelectedDate();
             });
@@ -294,12 +308,14 @@ public class ClientController implements ClientUI {
 
     private void applySuggestedTime(Timestamp ts) {
         LocalDateTime ldt = ts.toLocalDateTime();
+        String hhmm = String.format("%02d:%02d", ldt.getHour(), ldt.getMinute());
 
+        // If the date changes, the time list reloads; select this time again when it arrives
+        pendingTimeToSelect = hhmm;
         if (dpReservationDate != null) {
             dpReservationDate.setValue(ldt.toLocalDate());
         }
-        if (cbReservationTime != null) {
-            String hhmm = String.format("%02d:%02d", ldt.getHour(), ldt.getMinute());
+        if (cbReservationTime != null && cbReservationTime.getItems().contains(hhmm)) {
             cbReservationTime.getSelectionModel().select(hhmm);
         }
 
@@ -308,41 +324,6 @@ public class ClientController implements ClientUI {
         }
     }
 
-    // ===== Networking =====
-    /**
-     * Configures and connects the shared client session to the server.
-     *
-     * @param host server IP/hostname
-     * @param port server port
-     */
-
-    public void connectToServer(String host, int port) {
-        try {
-            ClientSession.configure(host, port);
-            ClientSession.connect(this);
-
-            this.client = ClientSession.getClient();
-
-            lblStatus.setText("Connecting to " + host + ":" + port + " ...");
-        } catch (Exception e) {
-            lblStatus.setText("Connection failed: " + e.getMessage());
-        }
-    }
-    /**
-     * Disconnects the current shared client session from the server if connected.
-     */
-
-    public void disconnectFromServer() {
-        try {
-            BistroClient c = ClientSession.getClient();
-            this.client = c;
-
-            if (c != null && c.isConnected()) {
-                c.closeConnection();
-            }
-        } catch (Exception ignored) {
-        }
-    }
     /**
      * UI callback invoked when the client connection is established successfully.
      */
@@ -392,10 +373,17 @@ public class ClientController implements ClientUI {
                 case RESPONSE_MAKE_RESERVATION -> handleMakeReservationResponse(env.getPayload());
                 case RESPONSE_CHECK_AVAILABILITY -> handleAvailabilityCheckResponse(env.getPayload());
                 case RESPONSE_LEAVE_WAITING_LIST -> handleLeaveWaitingListResponse(env.getPayload());
+                case RESPONSE_CANCEL_RESERVATION -> {
+                    // Show the server's answer ("cancelled" / "not yours" / "not active") and refresh
+                    Object p = env.getPayload();
+                    lblStatus.setText(p == null ? "Cancel request processed." : p.toString());
+                    onRefreshReservations();
+                }
                 
                 case RESPONSE_GET_PROFILE -> handleGetProfileResponse(env.getPayload());
                 case RESPONSE_UPDATE_PROFILE -> handleUpdateProfileResponse(env.getPayload());
                 case RESPONSE_GET_AVAILABLE_TIMES -> handleAvailableTimesResponse(env.getPayload());
+                case RESPONSE_SUBSCRIBER_HISTORY -> handleSubscriberHistoryResponse(env.getPayload());
 
                 default -> lblStatus.setText("Server replied: " + env.getOp());
             }
@@ -471,8 +459,9 @@ public class ClientController implements ClientUI {
     private GuestContact askGuestEmailAndPhone() {
 
         Dialog<GuestContact> dialog = new Dialog<>();
-        dialog.setTitle("Customer Reservation");
-        dialog.setHeaderText("Enter your email and phone to receive confirmation + reminders");
+        dialog.setTitle("Customer Details");
+        dialog.setHeaderText("Enter your phone and/or email (at least one) to identify yourself\n"
+                + "and receive your confirmation code and reminders");
 
         ButtonType okBtn = new ButtonType("OK", ButtonBar.ButtonData.OK_DONE);
         dialog.getDialogPane().getButtonTypes().addAll(okBtn, ButtonType.CANCEL);
@@ -505,18 +494,22 @@ public class ClientController implements ClientUI {
             String email = emailField.getText() == null ? "" : emailField.getText().trim();
             String phone = phoneField.getText() == null ? "" : phoneField.getText().trim();
 
-            boolean okEmail = isValidEmailFormat(email);
-            boolean okPhone = isValidPhone10Digits(phone);
+            // Spec: phone AND/OR email -> at least one, and whatever is typed must be valid
+            boolean emailOk = email.isBlank() || isValidEmailFormat(email);
+            boolean phoneOk = phone.isBlank() || isValidPhone10Digits(phone);
+            boolean hasOne = !email.isBlank() || !phone.isBlank();
 
-            if (!email.isBlank() && !okEmail) {
+            if (!emailOk) {
                 lblError.setText("Invalid email format.");
-            } else if (!phone.isBlank() && !okPhone) {
+            } else if (!phoneOk) {
                 lblError.setText("Invalid phone (must be 10 digits like 05XXXXXXXX).");
+            } else if (!hasOne) {
+                lblError.setText("Enter a phone or an email (or both).");
             } else {
                 lblError.setText("");
             }
 
-            okButton.setDisable(!(okEmail && okPhone));
+            okButton.setDisable(!(emailOk && phoneOk && hasOne));
         };
 
         emailField.textProperty().addListener((obs, oldV, newV) -> validate.run());
@@ -528,7 +521,9 @@ public class ClientController implements ClientUI {
                 String email = emailField.getText() == null ? "" : emailField.getText().trim();
                 String phone = phoneField.getText() == null ? "" : phoneField.getText().trim();
                 // safety: validate again
-                if (!isValidEmailFormat(email) || !isValidPhone10Digits(phone)) return null;
+                if (email.isBlank() && phone.isBlank()) return null;
+                if (!email.isBlank() && !isValidEmailFormat(email)) return null;
+                if (!phone.isBlank() && !isValidPhone10Digits(phone)) return null;
                 return new GuestContact(email, phone);
             }
             return null;
@@ -563,11 +558,19 @@ public class ClientController implements ClientUI {
         }
 
         if (cbReservationTime.getItems().isEmpty()) {
-            if (lblReservationFormMsg != null) lblReservationFormMsg.setText("Restaurant is closed on selected date.");
+            if (lblReservationFormMsg != null) {
+                lblReservationFormMsg.setText("No available times for this date and party size "
+                        + "(closed, fully booked, or the group is larger than our biggest table).");
+            }
         } else {
-            cbReservationTime.getSelectionModel().selectFirst(); // ✅ now it will be 09:00/whatever first
-            if (lblReservationFormMsg != null) lblReservationFormMsg.setText("");
+            if (pendingTimeToSelect != null && cbReservationTime.getItems().contains(pendingTimeToSelect)) {
+                cbReservationTime.getSelectionModel().select(pendingTimeToSelect); // chosen alternative
+            } else {
+                cbReservationTime.getSelectionModel().selectFirst();
+                if (lblReservationFormMsg != null) lblReservationFormMsg.setText("");
+            }
         }
+        pendingTimeToSelect = null;
     }
 
 
@@ -656,18 +659,10 @@ public class ClientController implements ClientUI {
                     if (lblReservationFormMsg != null) lblReservationFormMsg.setText("Cancelled.");
                     return;
                 }
-                guestEmail = contact.email;
-                guestPhone = contact.phone;
+                // Spec: phone and/or email (the dialog guarantees at least one valid value)
+                guestEmail = contact.email.isBlank() ? null : contact.email;
+                guestPhone = contact.phone.isBlank() ? null : contact.phone;
 
-                if (guestEmail.isBlank()) {
-                    if (lblReservationFormMsg != null) lblReservationFormMsg.setText("Email is required for customers.");
-                    return;
-                }
-                if (guestPhone.isBlank()) {
-                    if (lblReservationFormMsg != null) lblReservationFormMsg.setText("Phone is required for customers.");
-                    return;
-                }
-                
                 ClientSession.setGuestEmail(guestEmail);
                 ClientSession.setGuestPhone(guestPhone);
             }
@@ -810,65 +805,20 @@ public class ClientController implements ClientUI {
     }
 
     /**
-     * Converts a reservation DTO (unknown concrete type) into a {@link ReservationRow} using reflection.
+     * Converts a {@link ReservationDTO} from the server into a table row.
      *
      * @param dto reservation DTO object returned by the server
-     * @return a populated {@link ReservationRow}, or null if conversion failed
+     * @return a populated {@link ReservationRow}, or null if the object is not a ReservationDTO
      */
-
     private ReservationRow dtoToRow(Object dto) {
-        try {
-            int id = getInt(dto, "getReservationId", 0);
-            String code = getString(dto, "getConfirmationCode", null);
-            if (code == null) code = getString(dto, "getCode", "-");
-
-            String resTime = getString(dto, "getReservationTime", "-");
-            String expTime = getString(dto, "getExpiryTime", "-");
-            int customers = getInt(dto, "getNumOfCustomers", 0);
-            String status = getString(dto, "getStatus", "-");
-
-            return new ReservationRow(id, code, resTime, expTime, customers, status);
-        } catch (Exception ignored) {
-            return null;
-        }
-    }
-    /**
-     * Invokes a no-arg getter method by reflection and returns its string form.
-     *
-     * @param obj target object
-     * @param methodName getter method name to call
-     * @param def default value used when invocation fails or returns null
-     * @return the extracted string value, or the default value
-     */
-
-    private String getString(Object obj, String methodName, String def) {
-        try {
-            Method m = obj.getClass().getMethod(methodName);
-            Object v = m.invoke(obj);
-            return (v == null) ? def : v.toString();
-        } catch (Exception e) {
-            return def;
-        }
-    }
-    /**
-     * Invokes a no-arg getter method by reflection and parses the result as an int.
-     *
-     * @param obj target object
-     * @param methodName getter method name to call
-     * @param def default value used when invocation fails or returns null
-     * @return parsed integer value, or the default value
-     */
-
-    private int getInt(Object obj, String methodName, int def) {
-        try {
-            Method m = obj.getClass().getMethod(methodName);
-            Object v = m.invoke(obj);
-            if (v == null) return def;
-            if (v instanceof Number n) return n.intValue();
-            return Integer.parseInt(v.toString());
-        } catch (Exception e) {
-            return def;
-        }
+        if (!(dto instanceof ReservationDTO r)) return null;
+        return new ReservationRow(
+                r.getReservationId(),
+                r.getConfirmationCode() == null ? "-" : r.getConfirmationCode(),
+                r.getReservationTime() == null ? "-" : r.getReservationTime(),
+                r.getExpiryTime() == null ? "-" : r.getExpiryTime(),
+                r.getNumOfCustomers(),
+                r.getStatus() == null ? "-" : r.getStatus());
     }
     /**
      * Handles leave-waiting-list response and updates the status message.
@@ -886,11 +836,43 @@ public class ClientController implements ClientUI {
         // If server sends string messages for errors, show them
         lblStatus.setText(payload == null ? "✅ Left waiting list." : payload.toString());
     }
-    /**
-     * Requests available reservation times for the currently selected date from the server,
-     * and updates the time selection UI while loading.
-     */
+    /** @return the party size typed in the form, or 0 if empty/invalid */
+    private int parsePartySize() {
+        if (txtNumCustomers == null || txtNumCustomers.getText() == null) return 0;
+        try {
+            int n = Integer.parseInt(txtNumCustomers.getText().trim());
+            return n > 0 ? n : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
 
+    /**
+     * Makes sure a guest has identified with phone and/or email (spec: at least one).
+     * Asks with the dialog if nothing is stored yet.
+     *
+     * @return true if an identity is available, false if the guest cancelled
+     */
+    private boolean ensureGuestIdentity() {
+        String email = ClientSession.getGuestEmail();
+        String phone = ClientSession.getGuestPhone();
+        boolean known = (email != null && !email.isBlank()) || (phone != null && !phone.isBlank());
+        if (known) return true;
+
+        GuestContact contact = askGuestEmailAndPhone();
+        if (contact == null) {
+            lblStatus.setText("Cancelled.");
+            return false;
+        }
+        ClientSession.setGuestEmail(contact.email.isBlank() ? null : contact.email.trim());
+        ClientSession.setGuestPhone(contact.phone.isBlank() ? null : contact.phone.trim());
+        return true;
+    }
+
+    /**
+     * Requests the bookable times (restaurant open AND room for the party size) for the selected
+     * date from the server, and updates the time selection UI while loading.
+     */
     private void requestAvailableTimesForSelectedDate() {
         this.client = ClientSession.getClient();
 
@@ -904,8 +886,18 @@ public class ClientController implements ClientUI {
         LocalDate date = dpReservationDate.getValue();
         if (date == null) return;
 
+        // The spec says only times with ROOM are shown, and room depends on the party size
+        int people = parsePartySize();
+        if (people <= 0) {
+            cbReservationTime.getSelectionModel().clearSelection();
+            cbReservationTime.setValue(null);
+            cbReservationTime.getItems().clear();
+            cbReservationTime.setPromptText("Enter number of diners first");
+            return;
+        }
+
         try {
-            Envelope env = Envelope.request(OpCode.REQUEST_GET_AVAILABLE_TIMES, date.toString());
+            Envelope env = Envelope.request(OpCode.REQUEST_GET_AVAILABLE_TIMES, new Object[] { date.toString(), people });
             client.sendToServer(new KryoMessage("ENVELOPE", KryoUtil.toBytes(env)));
 
             cbReservationTime.getItems().clear();
@@ -975,25 +967,7 @@ public class ClientController implements ClientUI {
 
         try {
             // If customer and guest identity not known yet, ask now (covers clicking Refresh directly)
-            if (!isSubscriber) {
-                String email = ClientSession.getGuestEmail();
-                String phone = ClientSession.getGuestPhone();
-
-                if (email == null || email.isBlank() || phone == null || phone.isBlank()) {
-                    GuestContact contact = askGuestEmailAndPhone();
-                    if (contact == null) {
-                        lblStatus.setText("Cancelled.");
-                        return;
-                    }
-                    if (contact.email == null || contact.email.isBlank()
-                            || contact.phone == null || contact.phone.isBlank()) {
-                        lblStatus.setText("Email + phone are required to view your reservations.");
-                        return;
-                    }
-                    ClientSession.setGuestEmail(contact.email.trim());
-                    ClientSession.setGuestPhone(contact.phone.trim());
-                }
-            }
+            if (!isSubscriber && !ensureGuestIdentity()) return;
 
             String role = ClientSession.getRole();
             String username = ClientSession.getUsername();
@@ -1039,27 +1013,12 @@ public class ClientController implements ClientUI {
 
             String role = ClientSession.getRole();              // "SUBSCRIBER" or "CUSTOMER"
             String username = ClientSession.getUsername();      // subscriber only
+
+            // Guest: identify with phone and/or email if not done yet
+            if (!"SUBSCRIBER".equalsIgnoreCase(role) && !ensureGuestIdentity()) return;
+
             String guestEmail = ClientSession.getGuestEmail();  // customer only (can be null)
             String guestPhone = ClientSession.getGuestPhone();  // customer only (can be null)
-
-            // If customer and no identity stored yet, ask now (same logic you used before)
-            if (!"SUBSCRIBER".equalsIgnoreCase(role)) {
-                if (guestEmail == null || guestEmail.isBlank() || guestPhone == null || guestPhone.isBlank()) {
-                    GuestContact contact = askGuestEmailAndPhone();
-                    if (contact == null) {
-                        lblStatus.setText("Cancelled.");
-                        return;
-                    }
-                    if (contact.email == null || contact.email.isBlank() || contact.phone == null || contact.phone.isBlank()) {
-                        lblStatus.setText("Email + phone are required.");
-                        return;
-                    }
-                    ClientSession.setGuestEmail(contact.email.trim());
-                    ClientSession.setGuestPhone(contact.phone.trim());
-                    guestEmail = contact.email.trim();
-                    guestPhone = contact.phone.trim();
-                }
-            }
 
             int reservationId = r.getReservationId();
 
@@ -1075,8 +1034,7 @@ public class ClientController implements ClientUI {
             client.sendToServer(new KryoMessage("ENVELOPE", KryoUtil.toBytes(env)));
 
             lblStatus.setText("Cancelling reservation...");
-            
-            onRefreshReservations();
+            // the list is refreshed when RESPONSE_CANCEL_RESERVATION arrives
 
         } catch (Exception ex) {
             lblStatus.setText("Cancel failed: " + ex.getMessage());
@@ -1103,27 +1061,8 @@ public class ClientController implements ClientUI {
         // "My Reservations" -> go to Dashboard pane (where the table is) and refresh data
         showPane(paneDashboard);
 
-        // If guest/customer: ask for email+phone if not known yet (after logout / first entry)
-        if (!isSubscriber) {
-            String email = ClientSession.getGuestEmail();
-            String phone = ClientSession.getGuestPhone();
-
-            if (email == null || email.isBlank() || phone == null || phone.isBlank()) {
-                GuestContact contact = askGuestEmailAndPhone();
-                if (contact == null) {
-                    lblStatus.setText("Cancelled.");
-                    return;
-                }
-                if (contact.email == null || contact.email.isBlank()
-                        || contact.phone == null || contact.phone.isBlank()) {
-                    lblStatus.setText("Email + phone are required to view your reservations.");
-                    return;
-                }
-
-                ClientSession.setGuestEmail(contact.email.trim());
-                ClientSession.setGuestPhone(contact.phone.trim());
-            }
-        }
+        // Guest: identify with phone and/or email if not known yet (after logout / first entry)
+        if (!isSubscriber && !ensureGuestIdentity()) return;
 
         // Finally, fetch the list from the server
         onRefreshReservations();
@@ -1184,7 +1123,38 @@ public class ClientController implements ClientUI {
      * UI action: navigates to the history pane (subscribers only).
      */
 
-    @FXML private void onNavHistory() { if (isSubscriber) showPane(paneHistory); }
+    @FXML
+    private void onNavHistory() {
+        if (!isSubscriber) return;
+        showPane(paneHistory);
+
+        this.client = ClientSession.getClient();
+        if (client == null || !client.isConnected()) {
+            lblStatus.setText("Not connected.");
+            return;
+        }
+        try {
+            // Visits come from the server; past reservations are refreshed from the reservations list.
+            // The server always returns the history of the logged-in subscriber.
+            Envelope env = Envelope.request(OpCode.REQUEST_SUBSCRIBER_HISTORY, ClientSession.getUsername());
+            client.sendToServer(new KryoMessage("ENVELOPE", KryoUtil.toBytes(env)));
+            onRefreshReservations();
+            lblStatus.setText("Loading history...");
+        } catch (Exception ex) {
+            lblStatus.setText("Failed to load history: " + ex.getMessage());
+        }
+    }
+
+    /** Fills the visits list of the History page. */
+    private void handleSubscriberHistoryResponse(Object payload) {
+        if (lvVisits == null) return;
+        lvVisits.getItems().clear();
+        if (payload instanceof common.dto.HistoryDTO h && h.getVisits() != null) {
+            lvVisits.getItems().addAll(h.getVisits());
+        }
+        if (lvVisits.getItems().isEmpty()) lvVisits.setPlaceholder(new Label("No visits yet."));
+        lblStatus.setText("History loaded.");
+    }
     /**
      * UI action: logs out the current user and navigates back to the login screen.
      *
@@ -1193,8 +1163,9 @@ public class ClientController implements ClientUI {
 
     @FXML
     private void onLogout(ActionEvent e) {
-    	ClientSession.clearGuestIdentity();
-        SceneManager.showLogin();
+        // Clear everything (role, username, member code, guest contact), not only the guest part
+        ClientSession.clearAllIdentity();
+        SceneManager.showLogin(); // the login screen resets the server-side session too
     }
     /**
      * UI action: opens the new reservation form and refreshes available times for the selected date.
@@ -1256,16 +1227,6 @@ public class ClientController implements ClientUI {
         }
     }
 
-    /**
-     * Returns the current client instance associated with this controller.
-     *
-     * @return current {@link BistroClient} reference (may be null)
-     */
-
-    ////to refactor
-    public BistroClient getClient() {
-        return client;
-    }
  
 
     /**

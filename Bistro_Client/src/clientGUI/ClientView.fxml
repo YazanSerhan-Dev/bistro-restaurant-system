@@ -311,6 +311,7 @@
                 <children>
                     <Label text="History (Subscriber)" styleClass="section-title"/>
 
+                    <Label text="Past reservations"/>
 <TableView fx:id="tblHistory">
   <columns>
     <TableColumn fx:id="colHistResId" text="Reservation ID" prefWidth="120.0"/>
@@ -322,6 +323,8 @@
   </columns>
 </TableView>
 
+                    <Label text="Visits"/>
+                    <ListView fx:id="lvVisits" prefHeight="160.0"/>
 
                     <HBox spacing="10">
                         <children>

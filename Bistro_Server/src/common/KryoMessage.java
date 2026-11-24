@@ -82,3 +82,4 @@ public class KryoMessage implements Serializable {
         return KryoUtil.fromBytes(payload);
     }
 }
+

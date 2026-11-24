@@ -21,6 +21,9 @@ import javafx.stage.Stage;
  * is handled by {@link ServerController} and {@link BistroServer}.
  */
 public class ServerFX extends Application {
+
+    private ServerController controller;
+
     /**
      * Called automatically by the JavaFX runtime after launch().
      * Initializes and shows the main server window.
@@ -29,16 +32,30 @@ public class ServerFX extends Application {
      */
     @Override
     public void start(Stage primaryStage) throws Exception {
-        Parent root = FXMLLoader.load(getClass().getResource("ServerView.fxml"));
+        FXMLLoader loader = new FXMLLoader(getClass().getResource("ServerView.fxml"));
+        Parent root = loader.load();
+        controller = loader.getController();
+
         primaryStage.setTitle("Bistro Server - listening for client connections");
         primaryStage.setScene(new Scene(root));
         primaryStage.show();
     }
+
+    /**
+     * Called by JavaFX when the application exits (window closed with X, or Platform.exit()).
+     * Stops the server so the process really ends and the port is released.
+     */
+    @Override
+    public void stop() {
+        if (controller != null) controller.shutdown();
+    }
+
     /**
      * Application entry point.
      * Starts the JavaFX runtime, which then calls {@link #start(Stage)}.
      */
     public static void main(String[] args) {
+        ServerConfig.applyTimeZone(); // must happen before any date/time work
         launch(args);
     }
 }

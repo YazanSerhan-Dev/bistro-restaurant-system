@@ -13,8 +13,6 @@ import javafx.scene.Node;
 import javafx.scene.control.*;
 import javafx.scene.layout.VBox;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.sql.Timestamp;
 import java.time.format.DateTimeFormatter;
 
@@ -659,9 +657,9 @@ public class TerminalController implements ClientUI {
     /** Navigates to the Pay Bill screen. */
     @FXML private void onGoToPayBill() { SceneManager.showPayBill(); }
     /** Logs out to the login screen. */
-    @FXML private void onLogout()      { 
-    	ClientSession.clearSubscriberContact();
-    	SceneManager.showLogin(); 
+    @FXML private void onLogout()      {
+        ClientSession.clearAllIdentity(); // also clears cached subscriber email/phone
+        SceneManager.showLogin();          // the login screen resets the server-side session
     }
 
     // =========================
@@ -758,7 +756,8 @@ public class TerminalController implements ClientUI {
                         if (dto.isValid()) {
                             boolean canCheckIn = dto.isCheckInAllowed();
                             if (canCheckIn) {
-                                setValidationState(true, true, "VALID ✅", "Code valid. Ready to check-in.");
+                                setValidationState(true, true, "VALID ✅",
+                                        nonEmptyOr(dto.getMessage(), "Code valid. Ready to check-in."));
                                 lblWaitMessage.setText("");
                             } else {
                                 setValidationState(true, false, "VALID ✅",
@@ -879,7 +878,7 @@ public class TerminalController implements ClientUI {
                         refreshSubscriberActiveListIfNeeded();
                     }
 
-                    case RESPONSE_WAITING_LIST -> {
+                    case RESPONSE_WAITING_ADD -> {
                         joinWLInFlight = false; // unlock on response
 
                         Object payload = env.getPayload();
@@ -891,7 +890,15 @@ public class TerminalController implements ClientUI {
                             String email = dto.getEmail();
                             String phone = dto.getPhone();
 
-                            lblTerminalStatus.setText("✅ Joined waiting list. Code: " + (code == null ? "-" : code));
+                            String seatedTable = dto.getTableId();
+                            if (seatedTable != null && !seatedTable.isBlank()) {
+                                // A table was free: go straight to it (no waiting list)
+                                lblTerminalStatus.setText("✅ A table is free - please go to table " + seatedTable
+                                        + " now. Keep your code for the bill: " + (code == null ? "-" : code));
+                                lblTableNumber.setText(seatedTable);
+                            } else {
+                                lblTerminalStatus.setText("✅ Joined waiting list. Code: " + (code == null ? "-" : code));
+                            }
 
                             // ✅ Fill Waiting List Details box
                             lblWaitCode.setText(code == null || code.isBlank() ? "-" : code);
@@ -1088,7 +1095,7 @@ public class TerminalController implements ClientUI {
                 checkInInFlight = false;
                 joinWLInFlight = false;
                 leaveWLInFlight = false;
-                cancelResInFlight = false;   // ✅ ADD THIS
+                cancelResInFlight = false;
                 return;
             }
 
@@ -1103,7 +1110,7 @@ public class TerminalController implements ClientUI {
             checkInInFlight = false;
             joinWLInFlight = false;
             leaveWLInFlight = false;
-            cancelResInFlight = false;   // ✅ ADD THIS
+            cancelResInFlight = false;
         }
     }
 
@@ -1122,45 +1129,11 @@ public class TerminalController implements ClientUI {
             if (msg instanceof KryoMessage km) {
                 if (!"ENVELOPE".equals(km.getType())) return null;
 
-                byte[] bytes = extractBytesFromKryoMessage(km);
+                byte[] bytes = km.getPayload();
                 if (bytes == null || bytes.length == 0) return null;
 
                 // KryoUtil.fromBytes takes ONE arg
                 return KryoUtil.fromBytes(bytes);
-            }
-
-            return null;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-    /**
-     * Extracts serialized bytes from {@link KryoMessage} using reflection.
-     * Tries common getter names first, then common field names as fallback.
-     *
-     * @return byte array payload if found; otherwise {@code null}.
-     */
-    private byte[] extractBytesFromKryoMessage(KryoMessage km) {
-        try {
-            // 1) try common method names
-            String[] methodNames = {"getBytes", "getData", "getPayload", "getBody", "bytes", "data", "payload"};
-            for (String name : methodNames) {
-                try {
-                    Method m = km.getClass().getMethod(name);
-                    Object val = m.invoke(km);
-                    if (val instanceof byte[] b) return b;
-                } catch (NoSuchMethodException ignored) {}
-            }
-
-            // 2) try common field names
-            String[] fieldNames = {"bytes", "data", "payload", "body"};
-            for (String fName : fieldNames) {
-                try {
-                    Field f = km.getClass().getDeclaredField(fName);
-                    f.setAccessible(true);
-                    Object val = f.get(km);
-                    if (val instanceof byte[] b) return b;
-                } catch (NoSuchFieldException ignored) {}
             }
 
             return null;

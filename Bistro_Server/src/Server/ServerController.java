@@ -113,12 +113,23 @@ public class ServerController {
      */
     @FXML
     private void onExit() {
+        shutdown();
+        Platform.exit();
+    }
+
+    /**
+     * Stops everything the server started (OCSF listener + client connections, background jobs,
+     * MQTT, DB pool). Called by the Exit button and when the window is closed with X,
+     * so no server process is left running in the background holding port 5555.
+     */
+    public void shutdown() {
         try {
             if (server != null) {
-                server.close();
+                server.close(); // closes all client connections and triggers serverStopped()
             }
         } catch (IOException ignored) { }
-        Platform.exit();
+        BackgroundJobs.stop();
+        DataBase.MySQLConnectionPool.shutdownIfCreated();
     }
 
     /* ========== Called from BistroServer (server thread) ========== */

@@ -100,14 +100,14 @@ public class BillDAO {
                 return BillLookupResult.notFound("No activity found for this code.");
             }
 
-            // 3) Find ACTIVE visit (Option A: actual_end_time IS NULL)
+            // 3) Find ACTIVE visit (actual_end_time IS NULL)
             VisitRow v = findActiveVisit(conn, ua.activityId);
             if (v == null) {
-                // maybe it was already paid / ended; try last visit to show "already paid"
+                // maybe it was already paid / ended; show "already paid" if so
                 VisitRow last = findLastVisit(conn, ua.activityId);
                 if (last == null) return BillLookupResult.notFound("No visit found for this code.");
 
-                BillRow b2 = findBillByVisit(conn, last.visitId);
+                BillRow b2 = findLatestBillByActivity(conn, ua.activityId);
                 if (b2 != null && "YES".equalsIgnoreCase(b2.isPaid)) {
                     BillDTO dtoPaid = buildBillDTO(ua, last, b2);
                     return BillLookupResult.alreadyPaid(dtoPaid, "Bill already paid.");
@@ -116,27 +116,11 @@ public class BillDAO {
                 return BillLookupResult.notFound("No active visit for this code (not checked-in or already ended).");
             }
 
-            // 4) Find bill for that visit
-            BillRow b = findBillByVisit(conn, v.visitId);
+            // 4) One bill per party: look it up by ACTIVITY (a multi-table party has several visits,
+            //    looking up by one visit could create a second bill for the same party).
+            BillRow b = getOrCreateBillForActivity(conn, ua.activityId, reservationId, waitingId);
             if (b == null) {
-                // ✅ Create bill on-demand (first lookup)
-                double subtotal = computeSubtotalForCode(conn, reservationId, waitingId);
-
-                // if you have no pricing model yet, subtotal will be a simple placeholder
-                try (PreparedStatement ps = conn.prepareStatement("""
-                    INSERT INTO bill (visit_id, total_amount, is_subscriber_discount, is_paid)
-                    VALUES (?, ?, 'NO', 'NO')
-                """)) {
-                    ps.setInt(1, v.visitId);
-                    ps.setDouble(2, subtotal);
-                    ps.executeUpdate();
-                }
-
-                // re-fetch
-                b = findBillByVisit(conn, v.visitId);
-                if (b == null) {
-                    return BillLookupResult.notFound("Failed to create bill for this visit.");
-                }
+                return BillLookupResult.notFound("Failed to create bill for this visit.");
             }
 
 
@@ -250,11 +234,11 @@ public class BillDAO {
                 return PayBillResult.fail("No active visit found for this code.");
             }
 
-            // ✅ OPTION B SAFE: bill must be found by ACTIVITY, not by a random visit_id
-            BillRow b = findLatestBillByActivity(conn, ua.activityId);
+            // Bill is found by ACTIVITY (one bill per party). Create it if nobody opened it yet.
+            BillRow b = getOrCreateBillForActivity(conn, ua.activityId, reservationId, waitingId);
             if (b == null) {
                 conn.rollback();
-                return PayBillResult.fail("Bill not created yet for this activity. Please click 'Find Bill' first.");
+                return PayBillResult.fail("Could not create the bill for this visit.");
             }
 
             if ("YES".equalsIgnoreCase(b.isPaid)) {
@@ -262,11 +246,10 @@ public class BillDAO {
                 return PayBillResult.fail("Bill already paid.");
             }
 
-            // compute final amount (10% for subscriber)
-            double subtotal = b.totalAmount;
+            // compute final amount (10% for subscriber), rounded to agorot
             boolean subscriber = (ua.subscriberUsername != null && !ua.subscriberUsername.isBlank());
-            double discount = subscriber ? subtotal * 0.10 : 0.0;
-            double total = subtotal - discount;
+            double[] amounts = computeAmounts(b.totalAmount, subscriber);
+            double total = amounts[2];
 
             // 1) Update bill
             try (PreparedStatement ps = conn.prepareStatement("""
@@ -403,6 +386,90 @@ public class BillDAO {
     }
 
 
+    /** Guards "find bill / create bill" so two lookups at once don't create two bills for one party. */
+    private static final Object BILL_LOCK = new Object();
+
+    /**
+     * Returns the party's bill, creating it (on its active visit) if it does not exist yet.
+     *
+     * @return the bill, or null if the party has no active visit
+     */
+    private static BillRow getOrCreateBillForActivity(Connection conn, int activityId,
+                                                      Integer reservationId, Integer waitingId) throws Exception {
+        synchronized (BILL_LOCK) {
+            BillRow b = findLatestBillByActivity(conn, activityId);
+            if (b != null) return b;
+
+            VisitRow v = findActiveVisit(conn, activityId);
+            if (v == null) return null;
+
+            double subtotal = computeSubtotalForCode(conn, reservationId, waitingId);
+            try (PreparedStatement ps = conn.prepareStatement("""
+                INSERT INTO bill (visit_id, total_amount, is_subscriber_discount, is_paid)
+                VALUES (?, ?, 'NO', 'NO')
+            """)) {
+                ps.setInt(1, v.visitId);
+                ps.setDouble(2, subtotal);
+                ps.executeUpdate();
+            }
+            return findLatestBillByActivity(conn, activityId);
+        }
+    }
+
+    /**
+     * Creates bills for parties that have been seated for 2+ hours but whose bill was never opened.
+     * <p>
+     * Bills used to be created only when someone clicked "Find Bill", so the 2-hour payment reminder
+     * (which looks for unpaid bills) never fired for those parties.
+     *
+     * @return number of bills created
+     * @throws Exception on database error
+     */
+    public static int createMissingBillsForOverdueVisits() throws Exception {
+        String sql = """
+            SELECT ua.activity_id, ua.reservation_id, ua.waiting_id
+            FROM user_activity ua
+            WHERE EXISTS (
+                    SELECT 1 FROM visit v
+                    WHERE v.activity_id = ua.activity_id
+                      AND v.actual_end_time IS NULL
+                      AND v.actual_start_time <= (NOW() - INTERVAL 2 HOUR))
+              AND NOT EXISTS (
+                    SELECT 1 FROM bill b
+                    JOIN visit v2 ON v2.visit_id = b.visit_id
+                    WHERE v2.activity_id = ua.activity_id)
+        """;
+
+        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
+        PooledConnection pc = pool.getConnection();
+        Connection conn = pc.getConnection();
+
+        try {
+            List<int[]> rows = new ArrayList<>(); // {activityId, reservationId or -1, waitingId or -1}
+            try (PreparedStatement ps = conn.prepareStatement(sql);
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int activityId = rs.getInt(1);
+                    int resId = rs.getInt(2);
+                    if (rs.wasNull()) resId = -1;
+                    int waitId = rs.getInt(3);
+                    if (rs.wasNull()) waitId = -1;
+                    rows.add(new int[] { activityId, resId, waitId });
+                }
+            }
+
+            int created = 0;
+            for (int[] r : rows) {
+                BillRow b = getOrCreateBillForActivity(conn, r[0],
+                        r[1] > 0 ? r[1] : null, r[2] > 0 ? r[2] : null);
+                if (b != null) created++;
+            }
+            return created;
+        } finally {
+            pool.releaseConnection(pc);
+        }
+    }
+
     private static Integer findReservationIdByCode(Connection conn, String code) throws Exception {
         try (PreparedStatement ps = conn.prepareStatement("""
             SELECT reservation_id FROM reservation WHERE confirmation_code = ?
@@ -510,33 +577,46 @@ public class BillDAO {
         }
     }
 
-    private static BillRow findBillByVisit(Connection conn, int visitId) throws Exception {
-        try (PreparedStatement ps = conn.prepareStatement("""
-            SELECT bill_id, visit_id, total_amount, is_subscriber_discount, is_paid
-            FROM bill
-            WHERE visit_id = ?
-            ORDER BY bill_id DESC
-            LIMIT 1
-        """)) {
-            ps.setInt(1, visitId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) return null;
-                return new BillRow(
-                        rs.getInt("bill_id"),
-                        rs.getInt("visit_id"),
-                        rs.getDouble("total_amount"),
-                        rs.getString("is_subscriber_discount"),
-                        rs.getString("is_paid")
-                );
-            }
-        }
+    /** Subscriber discount rate (10%). */
+    private static final java.math.BigDecimal DISCOUNT_RATE = new java.math.BigDecimal("0.10");
+
+    /**
+     * Computes {subtotal, discount, total} from a subtotal, with money rounding (2 decimals, HALF_UP).
+     */
+    private static double[] computeAmounts(double subtotalValue, boolean subscriber) {
+        java.math.BigDecimal subtotal = java.math.BigDecimal.valueOf(subtotalValue)
+                .setScale(2, java.math.RoundingMode.HALF_UP);
+        java.math.BigDecimal discount = subscriber
+                ? subtotal.multiply(DISCOUNT_RATE).setScale(2, java.math.RoundingMode.HALF_UP)
+                : java.math.BigDecimal.ZERO.setScale(2);
+        java.math.BigDecimal total = subtotal.subtract(discount);
+        return new double[] { subtotal.doubleValue(), discount.doubleValue(), total.doubleValue() };
     }
 
     private static BillDTO buildBillDTO(UserActivityRow ua, VisitRow v, BillRow b) {
         boolean subscriber = (ua.subscriberUsername != null && !ua.subscriberUsername.isBlank());
-        double subtotal = b.totalAmount;
-        double discount = subscriber ? subtotal * 0.10 : 0.0;
-        double total = subtotal - discount;
+
+        double subtotal;
+        double discount;
+        double total;
+        if ("YES".equalsIgnoreCase(b.isPaid) && "YES".equalsIgnoreCase(b.isSubscriberDiscount)) {
+            // A paid subscriber bill stores the FINAL (already discounted) amount.
+            // Rebuild the subtotal instead of discounting a second time.
+            java.math.BigDecimal paid = java.math.BigDecimal.valueOf(b.totalAmount).setScale(2, java.math.RoundingMode.HALF_UP);
+            java.math.BigDecimal sub = paid.divide(java.math.BigDecimal.ONE.subtract(DISCOUNT_RATE), 2, java.math.RoundingMode.HALF_UP);
+            subtotal = sub.doubleValue();
+            discount = sub.subtract(paid).doubleValue();
+            total = paid.doubleValue();
+        } else if ("YES".equalsIgnoreCase(b.isPaid)) {
+            subtotal = b.totalAmount;
+            discount = 0.0;
+            total = b.totalAmount;
+        } else {
+            double[] a = computeAmounts(b.totalAmount, subscriber);
+            subtotal = a[0];
+            discount = a[1];
+            total = a[2];
+        }
 
         String customerName = subscriber ? ua.subscriberUsername : (ua.guestEmail != null && !ua.guestEmail.isBlank() ? ua.guestEmail : "Guest");
 
@@ -651,19 +731,32 @@ public class BillDAO {
         public final String email;
         public final String phone;
         public final String confirmationCode;
+        /** Bill details for the 2-hour message (spec: "a message with the bill details"). */
+        public final int people;
+        public final double subtotal;
+        public final double discount;
+        public final double total;
 
-        public BillReminderRow(int billId, String email, String phone, String confirmationCode) {
+        public BillReminderRow(int billId, String email, String phone, String confirmationCode,
+                               int people, double subtotal, double discount, double total) {
             this.billId = billId;
             this.email = email;
             this.phone = phone;
             this.confirmationCode = confirmationCode;
+            this.people = people;
+            this.subtotal = subtotal;
+            this.discount = discount;
+            this.total = total;
         }
     }
 
     public static List<BillReminderRow> findBillsNeedingReminder(int limit) throws Exception {
     	String sql = """
-    		    SELECT 
+    		    SELECT
     		        b.bill_id,
+    		        b.total_amount,
+    		        (ua.subscriber_username IS NOT NULL) AS is_subscriber,
+    		        COALESCE(r.num_of_customers, wl.num_of_customers, 0) AS people,
     		        COALESCE(s.email, ua.guest_email) AS email,
     		        COALESCE(s.phone, ua.guest_phone) AS phone,
     		        COALESCE(r.confirmation_code, wl.confirmation_code) AS code
@@ -677,8 +770,8 @@ public class BillDAO {
     		      AND b.reminder_sent = 'NO'
     		      AND v.actual_end_time IS NULL
     		      AND v.actual_start_time <= (NOW() - INTERVAL 2 HOUR)
-    		      AND COALESCE(s.email, ua.guest_email) IS NOT NULL
-    		      AND COALESCE(s.email, ua.guest_email) <> ''
+    		      -- at least one way to reach the customer (email, or phone for the SMS)
+    		      AND (COALESCE(s.email, ua.guest_email, '') <> '' OR COALESCE(s.phone, ua.guest_phone, '') <> '')
     		      AND COALESCE(r.confirmation_code, wl.confirmation_code) IS NOT NULL
     		      AND COALESCE(r.confirmation_code, wl.confirmation_code) <> ''
     		    ORDER BY v.actual_start_time ASC
@@ -696,12 +789,15 @@ public class BillDAO {
             List<BillReminderRow> out = new ArrayList<>();
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                	out.add(new BillReminderRow(
-                	        rs.getInt("bill_id"),
-                	        rs.getString("email"),
-                	        rs.getString("phone"),
-                	        rs.getString("code")
-                	));
+                    double[] a = computeAmounts(rs.getDouble("total_amount"), rs.getInt("is_subscriber") == 1);
+                    out.add(new BillReminderRow(
+                            rs.getInt("bill_id"),
+                            rs.getString("email"),
+                            rs.getString("phone"),
+                            rs.getString("code"),
+                            rs.getInt("people"),
+                            a[0], a[1], a[2]
+                    ));
                 }
             }
             return out;

@@ -83,7 +83,7 @@ public class VisitDAO {
     }
 
     // =============================================================
-    // 2. CHECK EXISTENCE METHODS (From MAIN Branch)
+    // 2. CHECK EXISTENCE METHODS
     // =============================================================
     /**
      * Checks whether a visit already exists for a waiting-list entry.
@@ -137,33 +137,6 @@ public class VisitDAO {
         }
     }
     /**
-     * Checks whether a visit already exists for a reservation.
-     *
-     * @param reservationId reservation ID
-     * @return true if a visit exists, false otherwise
-     * @throws Exception on database error
-     */
-    public static boolean existsVisitForReservationId(int reservationId) throws Exception {
-        String sql = """
-            SELECT 1
-            FROM visit v
-            JOIN user_activity ua ON ua.activity_id = v.activity_id
-            WHERE ua.reservation_id = ?
-            LIMIT 1
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, reservationId);
-            return ps.executeQuery().next();
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
-    /**
      * Same as existsVisitForReservationId, using an existing connection.
      *
      * @param conn active database connection
@@ -187,7 +160,7 @@ public class VisitDAO {
     }
 
     // =============================================================
-    // 3. UI DISPLAY METHODS (From HEAD/Your Branch)
+    // 3. UI DISPLAY METHODS
     // =============================================================
     /**
      * Retrieves all currently active diners in the restaurant.
@@ -261,34 +234,48 @@ public class VisitDAO {
         return list;
     }
     /**
-     * Retrieves visit history summaries for a subscriber.
-     * <p>
-     * Each entry contains a simple textual summary with table ID and visit time.
+     * Retrieves the visit history of a subscriber, newest first, one line per visit:
+     * {@code "2026-01-20 18:05 -> 20:10 | Table T3 | Reservation"} (or "still seated").
      *
      * @param username subscriber username
      * @return list of visit summary strings
      */
     public static List<String> getVisitsBySubscriber(String username) {
         List<String> list = new ArrayList<>();
-        // ✅ JOIN with user_activity to find the username
-        String sql = "SELECT v.* FROM visit v " +
-                     "JOIN user_activity ua ON v.activity_id = ua.activity_id " +
-                     "WHERE ua.subscriber_username = ?";
+        String sql = """
+            SELECT MIN(v.actual_start_time)              AS start_time,
+                   MAX(v.actual_end_time)                AS end_time,
+                   SUM(v.actual_end_time IS NULL)        AS open_rows,
+                   GROUP_CONCAT(DISTINCT v.table_id)     AS tables,
+                   MAX(ua.reservation_id IS NOT NULL)    AS from_reservation
+            FROM visit v
+            JOIN user_activity ua ON v.activity_id = ua.activity_id
+            WHERE ua.subscriber_username = ?
+            GROUP BY v.activity_id
+            ORDER BY start_time DESC
+        """;
 
         MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
         PooledConnection pc = pool.getConnection();
         Connection conn = pc.getConnection();
 
+        java.time.format.DateTimeFormatter dayTime = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+        java.time.format.DateTimeFormatter timeOnly = java.time.format.DateTimeFormatter.ofPattern("HH:mm");
+
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, username);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String start = rs.getString("actual_start_time");
-                    String end = rs.getString("actual_end_time");
-                    String table = rs.getString("table_id");
-                    
-                    // Simple summary string
-                    list.add("Table: " + table + " | Date: " + start);
+                    Timestamp start = rs.getTimestamp("start_time");
+                    Timestamp end = rs.getTimestamp("end_time");
+                    boolean stillSeated = rs.getInt("open_rows") > 0;
+
+                    String when = (start == null) ? "-" : start.toLocalDateTime().format(dayTime);
+                    String until = stillSeated ? "still seated"
+                            : (end == null ? "-" : end.toLocalDateTime().format(timeOnly));
+                    String source = rs.getInt("from_reservation") == 1 ? "Reservation" : "Waiting list";
+
+                    list.add(when + " -> " + until + " | Table " + rs.getString("tables") + " | " + source);
                 }
             }
         } catch (SQLException e) {
@@ -322,4 +309,4 @@ public class VisitDAO {
         }
     }
 
-}
+}

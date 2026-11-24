@@ -5,6 +5,14 @@
 
 # secrets / local runtime config
 server.properties
+email.properties
 *.env
 secrets.h
 wifi.h
+
+# OS / tool junk
+.DS_Store
+*.lck
+
+# MQTT (Paho) file persistence folder (the server now uses in-memory persistence)
+bistro-server-tcp*/

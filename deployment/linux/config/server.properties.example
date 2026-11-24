@@ -1,10 +1,29 @@
-# Database config (example)
+# Bistro server runtime config (example).
+# Copy to `server.properties` in the server's working directory
+# (Eclipse: Bistro_Server/, Linux service: /opt/bistro/) and fill in real values.
+# server.properties is git-ignored: never commit real passwords.
+
+# ---- Database ----
 db.host=127.0.0.1
 db.port=3306
 db.name=Bistro
 db.user=bistro
 db.password=CHANGE_ME
 
-# Optional: other runtime configs if you have them
-# mqtt.host=127.0.0.1
-# mqtt.port=1883
+# ---- Time zone of the restaurant ----
+# The server uses this for Java's clock AND for the MySQL session (NOW()),
+# so the 1-hour rule, available slots, check-in windows and reminders all agree.
+app.timezone=Asia/Jerusalem
+
+# ---- MQTT stats publisher (optional) ----
+mqtt.enabled=true
+mqtt.url=tcp://127.0.0.1:1883
+mqtt.clientId=bistro-server
+
+# ---- Email (optional) ----
+# Without these keys emails are skipped (SMS stubs are still printed to the log).
+# For Gmail use an "App password", not your real password.
+# smtp.host=smtp.gmail.com
+# smtp.port=587
+# email.from=your_project_gmail@gmail.com
+# email.password=YOUR_APP_PASSWORD

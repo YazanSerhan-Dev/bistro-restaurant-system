@@ -22,7 +22,7 @@ public class ReportRequestDTO implements Serializable {
      */
     private int year;
 
-    // ✅ ADD THIS: No-Argument Constructor (Required for serialization)
+    // No-argument constructor (required by Kryo serialization)
     /**
      * No-argument constructor.
      * <p>

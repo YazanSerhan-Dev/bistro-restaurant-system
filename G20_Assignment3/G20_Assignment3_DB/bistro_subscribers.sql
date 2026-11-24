@@ -35,7 +35,6 @@ CREATE TABLE `subscribers` (
   `birth_date` date NOT NULL,
   PRIMARY KEY (`username`),
   UNIQUE KEY `username` (`username`),
-  UNIQUE KEY `password` (`password`),
   UNIQUE KEY `phone` (`phone`),
   UNIQUE KEY `email` (`email`),
   UNIQUE KEY `member_code` (`member_code`),

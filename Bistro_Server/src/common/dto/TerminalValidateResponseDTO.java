@@ -97,3 +97,4 @@ public class TerminalValidateResponseDTO implements Serializable {
     /** Sets assigned table ID. */
     public void setTableId(String tableId) { this.tableId = tableId; }
 }
+
