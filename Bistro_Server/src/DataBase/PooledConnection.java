@@ -6,7 +6,7 @@ import java.sql.SQLException;
  * Creates a new pooled connection wrapper.
  *
  */
-public class PooledConnection {
+public final class PooledConnection {
 
     // The real JDBC connection to MySQL
     private final Connection conn;

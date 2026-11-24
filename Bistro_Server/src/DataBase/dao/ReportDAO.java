@@ -84,15 +84,15 @@ public class ReportDAO {
      */
     public static List<ReportDTO> getSubscriberActivityReport(int month, int year) throws Exception {
         List<ReportDTO> list = new ArrayList<>();
-        // Note: Using LEFT JOIN or just checking tables. 
-        // For simplicity, we count from user_activity.
+        // Subscribers report: only activity rows that belong to a subscriber (guests are excluded).
         String sql = """
-            SELECT 
+            SELECT
                 DATE(activity_date) as act_date,
                 COUNT(CASE WHEN reservation_id IS NOT NULL THEN 1 END) as total_res,
                 COUNT(CASE WHEN waiting_id IS NOT NULL THEN 1 END) as total_wait
             FROM user_activity
-            WHERE MONTH(activity_date) = ?
+            WHERE subscriber_username IS NOT NULL
+              AND MONTH(activity_date) = ?
               AND YEAR(activity_date) = ?
             GROUP BY act_date
             ORDER BY act_date ASC

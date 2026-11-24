@@ -2,9 +2,18 @@ package Server;
 
 import DataBase.dao.ReservationDAO;
 import DataBase.dao.VisitDAO;
-import org.eclipse.paho.client.mqttv3.MqttException;
 
+/**
+ * Periodically publishes today's reservation stats to an MQTT topic as a retained JSON message:
+ * {@code {"today":N,"served":M}}.
+ * <p>
+ * A message is published only when the numbers change, plus a heartbeat once a minute
+ * (the message is retained, so new subscribers always get the latest value).
+ */
 public class ReservationStatsMqttPublisher {
+
+    /** Re-publish unchanged values at least this often (ms). */
+    private static final long HEARTBEAT_MS = 60_000L;
 
     private final MqttBridge mqtt;
     private final String topic;
@@ -12,9 +21,10 @@ public class ReservationStatsMqttPublisher {
     private Thread worker;
     private volatile boolean running = false;
 
-    // last published values to avoid spam
+    // last published values (to avoid spamming the broker and the console)
     private int lastToday = Integer.MIN_VALUE;
     private int lastServed = Integer.MIN_VALUE;
+    private long lastPublishAt = 0L;
 
     public ReservationStatsMqttPublisher(MqttBridge mqtt, String topic, long intervalMs) {
         this.mqtt = mqtt;
@@ -22,35 +32,36 @@ public class ReservationStatsMqttPublisher {
         this.intervalMs = intervalMs;
     }
 
-    public void start() {
+    public synchronized void start() {
         if (running) return;
         running = true;
 
         worker = new Thread(() -> {
             while (running) {
                 try {
-                    // If MQTT disconnected (broker restarted), try reconnect
+                    // First connect may have failed (broker started later): keep trying with the SAME client
                     if (!mqtt.isConnected()) {
                         try {
                             mqtt.connect();
-                        } catch (Exception ignored) {}
+                        } catch (Exception ignored) {
+                        }
                     }
 
-                    int today = ReservationDAO.countReservationsMadeToday();
-                    int served = VisitDAO.countReservationsServedToday();
+                    if (mqtt.isConnected()) {
+                        int today = Math.max(0, ReservationDAO.countReservationsMadeToday());
+                        int served = Math.max(0, VisitDAO.countReservationsServedToday());
 
-                    // never publish negatives
-                    if (today < 0) today = 0;
-                    if (served < 0) served = 0;
-
-                        lastToday = today;
-                        lastServed = served;
-
-                        String payload = "{\"today\":" + today + ",\"served\":" + served + "}";
-                        mqtt.publishRetained(topic, payload);
-
-                        System.out.println("[MQTT] Published: " + payload + " -> " + topic);
-
+                        long now = System.currentTimeMillis();
+                        boolean changed = today != lastToday || served != lastServed;
+                        if (changed || now - lastPublishAt >= HEARTBEAT_MS) {
+                            String payload = "{\"today\":" + today + ",\"served\":" + served + "}";
+                            mqtt.publishRetained(topic, payload);
+                            lastToday = today;
+                            lastServed = served;
+                            lastPublishAt = now;
+                            if (changed) System.out.println("[MQTT] Published: " + payload + " -> " + topic);
+                        }
+                    }
 
                 } catch (Exception e) {
                     System.out.println("[MQTT] Publisher error: " + e.getMessage());
@@ -58,7 +69,10 @@ public class ReservationStatsMqttPublisher {
 
                 try {
                     Thread.sleep(intervalMs);
-                } catch (InterruptedException ignored) {}
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }, "ReservationStatsMqttPublisher");
 
@@ -66,8 +80,9 @@ public class ReservationStatsMqttPublisher {
         worker.start();
     }
 
-    public void stop() {
+    public synchronized void stop() {
         running = false;
         if (worker != null) worker.interrupt();
+        worker = null;
     }
 }

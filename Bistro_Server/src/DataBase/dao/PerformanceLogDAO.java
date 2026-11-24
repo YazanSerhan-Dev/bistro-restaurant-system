@@ -55,126 +55,61 @@ public class PerformanceLogDAO {
         }
     }
     /**
-     * Logs an automatically-reserved visit that was not yet confirmed.
+     * Generates performance log entries for all completed visits of past months.
      * <p>
-     * Uses a sentinel value (-999) to mark unconfirmed auto-reservations.
-     *
-     * @param conn    active DB connection (part of a transaction)
-     * @param visitId visit identifier
-     * @throws Exception if a database error occurs
-     */
-    public static void insertAutoReservedNotConfirmed(Connection conn, int visitId) throws Exception {
-        String sql = """
-            INSERT INTO performance_log (visit_id, late_minutes, overstay_minutes, report_date)
-            VALUES (?, -999, 0, CURDATE())
-        """;
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, visitId);
-            ps.executeUpdate();
-        }
-    }
-    /**
-     * Checks whether a visit was auto-reserved and not confirmed yet.
-     *
-     * @param conn    active DB connection
-     * @param visitId visit identifier
-     * @return true if the visit is marked as auto-reserved and unconfirmed
-     * @throws Exception if a database error occurs
-     */
-    public static boolean isAutoReservedNotConfirmed(Connection conn, int visitId) throws Exception {
-        String sql = """
-            SELECT 1
-            FROM performance_log
-            WHERE visit_id = ? AND late_minutes = -999
-            LIMIT 1
-        """;
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, visitId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        }
-    }
-    /**
-     * Confirms an auto-reserved visit by clearing the sentinel value.
-     * <p>
-     * Converts the temporary auto-reservation marker into a normal log entry.
-     *
-     * @param conn    active DB connection
-     * @param visitId visit identifier
-     * @throws Exception if a database error occurs
-     */
-    public static void confirmAutoReserved(Connection conn, int visitId) throws Exception {
-        String sql = """
-            UPDATE performance_log
-            SET late_minutes = 0
-            WHERE visit_id = ? AND late_minutes = -999
-        """;
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, visitId);
-            ps.executeUpdate();
-        }
-    }
-    /**
-     * Deletes all performance log records for a specific visit.
-     *
-     * @param conn    active DB connection
-     * @param visitId visit identifier
-     * @throws Exception if a database error occurs
-     */
-    public static void deleteByVisitId(Connection conn, int visitId) throws Exception {
-        String sql = "DELETE FROM performance_log WHERE visit_id = ?";
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, visitId);
-            ps.executeUpdate();
-        }
-    }
-    /**
-     * Generates performance log entries for the previous month.
-     * <p>
-     * Calculates late arrivals and overstays for completed visits
-     * and avoids inserting duplicate records.
+     * Calculates late arrivals and overstays for completed visits and avoids duplicates.
+     * <ul>
+     *   <li>{@code report_date} is the DAY OF THE VISIT (it used to be the day the job ran, which put
+     *       last month's data under the current month in the manager report).</li>
+     *   <li>Covers every completed month that is not logged yet, so a month is not lost if the
+     *       server was down when the month changed.</li>
+     *   <li>A party seated at several tables has several visit rows; only one row per party
+     *       (the first visit of the activity) is logged, so minutes are not counted twice.</li>
+     * </ul>
      *
      * @return number of log rows inserted
      */
     public static int generateMonthlyReport() {
         int rowsAffected = 0;
-        
-        // This query selects visits from the LAST month that are NOT in performance_log yet
+
         String sql = """
             INSERT INTO performance_log (visit_id, late_minutes, overstay_minutes, report_date)
-            SELECT 
+            SELECT
                 v.visit_id,
-                
-                -- Calculate Late Minutes (Only for Reservations) --
-                CASE 
+
+                -- Late minutes (only for reservations)
+                CASE
                     WHEN r.reservation_time IS NOT NULL AND v.actual_start_time > r.reservation_time
                     THEN TIMESTAMPDIFF(MINUTE, r.reservation_time, v.actual_start_time)
-                    ELSE 0 
+                    ELSE 0
                 END AS late_calc,
-                
-                -- Calculate Overstay Minutes (Duration > 120 mins) --
-                CASE 
+
+                -- Overstay minutes (stay longer than 120 minutes)
+                CASE
                     WHEN TIMESTAMPDIFF(MINUTE, v.actual_start_time, v.actual_end_time) > 120
                     THEN TIMESTAMPDIFF(MINUTE, v.actual_start_time, v.actual_end_time) - 120
-                    ELSE 0 
+                    ELSE 0
                 END AS overstay_calc,
-                
-                CURRENT_DATE
-                
+
+                DATE(v.actual_start_time) AS visit_day
+
             FROM visit v
             JOIN user_activity ua ON v.activity_id = ua.activity_id
             LEFT JOIN reservation r ON ua.reservation_id = r.reservation_id
-            WHERE 
-                -- 1. Visit is completed
+            WHERE
+                -- 1. Visit is completed, and finished before the current month started
                 v.actual_end_time IS NOT NULL
-                
-                -- 2. Visit happened in the PREVIOUS month (relative to today)
-                AND MONTH(v.actual_end_time) = MONTH(CURRENT_DATE - INTERVAL 1 MONTH)
-                AND YEAR(v.actual_end_time) = YEAR(CURRENT_DATE - INTERVAL 1 MONTH)
-                
-                -- 3. Avoid duplicates: Only insert if not already logged
-                AND v.visit_id NOT IN (SELECT visit_id FROM performance_log)
+                AND v.actual_end_time < DATE_SUB(CURRENT_DATE, INTERVAL DAYOFMONTH(CURRENT_DATE) - 1 DAY)
+
+                -- 2. One row per party (multi-table parties have several visit rows)
+                AND v.visit_id = (SELECT MIN(v2.visit_id) FROM visit v2 WHERE v2.activity_id = v.activity_id)
+
+                -- 3. Avoid duplicates: party not logged yet
+                AND NOT EXISTS (
+                    SELECT 1 FROM performance_log pl
+                    JOIN visit v3 ON v3.visit_id = pl.visit_id
+                    WHERE v3.activity_id = v.activity_id
+                )
         """;
 
         MySQLConnectionPool pool = MySQLConnectionPool.getInstance();

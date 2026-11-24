@@ -93,7 +93,6 @@ public class UserActivityDAO {
             pool.releaseConnection(pc);
         }
     }
- // ADD THIS METHOD inside UserActivityDAO class
     /**
      * Inserts a user activity record using an existing connection.
      * <p>
@@ -107,9 +106,10 @@ public class UserActivityDAO {
      * @param reservationId reservation ID (nullable)
      * @param waitingId waiting-list ID (nullable)
      * @param activityDate activity timestamp
+     * @return the generated activity_id (-1 if the driver returned none)
      * @throws Exception on database error
      */
-    public static void insertActivity(Connection conn,
+    public static int insertActivity(Connection conn,
                                       String subscriberUsername,
                                       String guestPhone,
                                       String guestEmail,
@@ -124,7 +124,7 @@ public class UserActivityDAO {
             VALUES (?, ?, ?, ?, ?, ?)
         """;
 
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (PreparedStatement ps = conn.prepareStatement(sql, java.sql.Statement.RETURN_GENERATED_KEYS)) {
 
             if (subscriberUsername == null || subscriberUsername.isEmpty())
                 ps.setNull(1, Types.VARCHAR);
@@ -154,58 +154,9 @@ public class UserActivityDAO {
             ps.setTimestamp(6, activityDate);
 
             ps.executeUpdate();
-        }
-    }
-    /**
-     * Inserts a waiting-list activity for a guest.
-     *
-     * @param waitingId waiting-list ID
-     * @param email guest email
-     * @param phone guest phone
-     * @throws Exception on database error
-     */
-    public static void insertWaitingActivity(int waitingId, String email, String phone) throws Exception {
-        String sql = """
-            INSERT INTO user_activity (guest_phone, guest_email, waiting_id, activity_date)
-            VALUES (?, ?, ?, NOW())
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, phone);
-            ps.setString(2, email);
-            ps.setInt(3, waitingId);
-            ps.executeUpdate();
-        } finally {
-            pool.releaseConnection(pc);
-        }
-    }
-    /**
-     * Inserts a waiting-list activity for a subscriber.
-     *
-     * @param waitingId waiting-list ID
-     * @param subscriberUsername subscriber username
-     * @throws Exception on database error
-     */
-    public static void insertSubscriberWaitingActivity(int waitingId, String subscriberUsername) throws Exception {
-        String sql = """
-            INSERT INTO user_activity (subscriber_username, waiting_id, activity_date)
-            VALUES (?, ?, NOW())
-        """;
-
-        MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-        PooledConnection pc = pool.getConnection();
-        Connection conn = pc.getConnection();
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, subscriberUsername);
-            ps.setInt(2, waitingId);
-            ps.executeUpdate();
-        } finally {
-            pool.releaseConnection(pc);
+            try (ResultSet keys = ps.getGeneratedKeys()) {
+                return keys.next() ? keys.getInt(1) : -1;
+            }
         }
     }
 
@@ -389,122 +340,6 @@ public class UserActivityDAO {
          }
      }
  }
- /**
-  * Simple holder for an active confirmation code.
-  * <p>
-  * Used mainly for terminal and subscriber quick-lookup flows.
-  */
- public static class ActiveCodeResult {
-	    public final String type;  // "RESERVATION" or "WAITING_LIST"
-	    public final String code;  // confirmation_code
-
-	    public ActiveCodeResult(String type, String code) {
-	        this.type = type;
-	        this.code = code;
-	    }
-	}
- /**
-  * Finds the most relevant active confirmation code for a subscriber.
-  * <p>
-  * Priority:
-  * 1) ASSIGNED waiting list
-  * 2) Closest upcoming active reservation
-  * 3) Latest waiting-list entry
-  *
-  * @param subscriberUsername subscriber username
-  * @return ActiveCodeResult or null if none found
-  * @throws Exception on database error
-  */
- public static ActiveCodeResult findActiveCodeBySubscriberUsername(String subscriberUsername) throws Exception {
-
-	    // 1) Priority: ASSIGNED waiting list (urgent now)
-	    String sqlAssignedWaiting = """
-	        SELECT w.confirmation_code
-	        FROM user_activity ua
-	        JOIN waiting_list w ON w.waiting_id = ua.waiting_id
-	        WHERE ua.subscriber_username = ?
-	          AND ua.waiting_id IS NOT NULL
-	          AND w.status = 'ASSIGNED'
-	        ORDER BY w.request_time DESC
-	        LIMIT 1
-	    """;
-
-	    // 2) Closest upcoming active reservation
-	    String sqlClosestReservation = """
-	        SELECT r.confirmation_code
-	        FROM user_activity ua
-	        JOIN reservation r ON r.reservation_id = ua.reservation_id
-	        WHERE ua.subscriber_username = ?
-	          AND ua.reservation_id IS NOT NULL
-	          AND r.status IN ('CONFIRMED','PENDING')
-	        ORDER BY
-	          CASE WHEN r.reservation_time >= NOW() THEN 0 ELSE 1 END,
-	          ABS(TIMESTAMPDIFF(SECOND, r.reservation_time, NOW())) ASC
-	        LIMIT 1
-	    """;
-
-	    // 3) Fallback: latest WAITING waiting list
-	    String sqlLatestWaiting = """
-	        SELECT w.confirmation_code
-	        FROM user_activity ua
-	        JOIN waiting_list w ON w.waiting_id = ua.waiting_id
-	        WHERE ua.subscriber_username = ?
-	          AND ua.waiting_id IS NOT NULL
-	          AND w.status = 'WAITING'
-	        ORDER BY w.request_time DESC
-	        LIMIT 1
-	    """;
-
-	    MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
-	    PooledConnection pc = pool.getConnection();
-	    Connection conn = pc.getConnection();
-
-	    try {
-	        // Step 1: ASSIGNED waiting list
-	        try (PreparedStatement ps = conn.prepareStatement(sqlAssignedWaiting)) {
-	            ps.setString(1, subscriberUsername);
-	            try (ResultSet rs = ps.executeQuery()) {
-	                if (rs.next()) {
-	                    String code = rs.getString("confirmation_code");
-	                    if (code != null && !code.isBlank()) {
-	                        return new ActiveCodeResult("WAITING_LIST", code.trim());
-	                    }
-	                }
-	            }
-	        }
-
-	        // Step 2: closest reservation
-	        try (PreparedStatement ps = conn.prepareStatement(sqlClosestReservation)) {
-	            ps.setString(1, subscriberUsername);
-	            try (ResultSet rs = ps.executeQuery()) {
-	                if (rs.next()) {
-	                    String code = rs.getString("confirmation_code");
-	                    if (code != null && !code.isBlank()) {
-	                        return new ActiveCodeResult("RESERVATION", code.trim());
-	                    }
-	                }
-	            }
-	        }
-
-	        // Step 3: latest WAITING list
-	        try (PreparedStatement ps = conn.prepareStatement(sqlLatestWaiting)) {
-	            ps.setString(1, subscriberUsername);
-	            try (ResultSet rs = ps.executeQuery()) {
-	                if (rs.next()) {
-	                    String code = rs.getString("confirmation_code");
-	                    if (code != null && !code.isBlank()) {
-	                        return new ActiveCodeResult("WAITING_LIST", code.trim());
-	                    }
-	                }
-	            }
-	        }
-
-	        return null;
-
-	    } finally {
-	        pool.releaseConnection(pc);
-	    }
-	}
  
  /**
   * Lists all active items for a subscriber.

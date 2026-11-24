@@ -33,8 +33,10 @@ public class BackgroundJobs {
     private static final AtomicBoolean started = new AtomicBoolean(false);
     private static final Object TABLE_ASSIGN_LOCK = new Object();
 
-    // ✅ In-memory protection: reminder sent once per server run (reservation reminder only)
+    // In-memory guard: reminder sent once per server run (reservation reminder only)
     private static final Set<Integer> reminderSent = ConcurrentHashMap.newKeySet();
+    /** End of the last reminder window that was processed (null = first run). */
+    private static volatile LocalDateTime lastReminderWindowEnd = null;
     /**
      * Starts all background jobs.
      *
@@ -49,8 +51,13 @@ public class BackgroundJobs {
             return;
         }
 
-        // We run 4 periodic tasks => pool size 4
-        scheduler = Executors.newScheduledThreadPool(4);
+        // 5 periodic tasks. Daemon threads: jobs must never keep the JVM alive after the server exits.
+        lastReminderWindowEnd = null;
+        scheduler = Executors.newScheduledThreadPool(5, r -> {
+            Thread t = new Thread(r, "BistroJob");
+            t.setDaemon(true);
+            return t;
+        });
 
         // =========================
         // Thread #1: Cancel NO-SHOWS (15 minutes)
@@ -210,21 +217,30 @@ public class BackgroundJobs {
      */
     private static void runBillReminderJobOnce() throws Exception {
 
+        // Parties seated 2+ hours ago may not have a bill yet (bills are otherwise created on "Find Bill").
+        int created = BillDAO.createMissingBillsForOverdueVisits();
+        if (created > 0) {
+            System.out.println("[JOB] Created " + created + " bill(s) for parties seated over 2 hours");
+        }
+
         List<BillDAO.BillReminderRow> due = BillDAO.findBillsNeedingReminder(25);
 
         for (BillDAO.BillReminderRow row : due) {
             try {
-                EmailService.sendBillReminder(row.email, row.confirmationCode);
-                EmailService.smsStub(row.phone,"[SMS] Bill reminder to | Code: "+ row.confirmationCode);
+                // Bill details by email + SMS (email skipped if the customer has none)
+                EmailService.sendBillReminder(row.email, row.confirmationCode,
+                        row.people, row.subtotal, row.discount, row.total);
+                EmailService.smsStub(row.phone, String.format(
+                        "Your Bistro bill: %d diners, subtotal %.2f, discount %.2f, total %.2f ILS. Pay with code %s",
+                        row.people, row.subtotal, row.discount, row.total, row.confirmationCode));
                 BillDAO.markReminderSent(row.billId);
 
-                System.out.println("[JOB] Bill reminder sent to " + row.email +
+                System.out.println("[JOB] Bill reminder queued for billId=" + row.billId +
                         " | code=" + row.confirmationCode);
 
             } catch (Exception sendErr) {
                 System.out.println("[JOB] Bill reminder failed for billId=" + row.billId +
                         " : " + sendErr.getMessage());
-                // Do NOT mark sent if email failed
             }
         }
     }
@@ -240,27 +256,23 @@ public class BackgroundJobs {
      */
     private static void runUpcomingReservationReminderOnce() throws Exception {
 
-        List<Reservation> all = new ReservationDAO().getAllReservations();
+        // Consecutive, non-overlapping windows (previousEnd, now+2h]: every reservation falls into
+        // exactly one run, so a reminder is not sent twice even if the server restarts
+        // (the in-memory set below is only an extra guard within one run).
+        LocalDateTime to = LocalDateTime.now().plusHours(2);
+        LocalDateTime from = (lastReminderWindowEnd != null) ? lastReminderWindowEnd : to.minusMinutes(1);
+        if (!to.isAfter(from)) return;
 
-        LocalDateTime now = LocalDateTime.now();
+        // Only the CONFIRMED reservations in the window (no longer loads the whole table every minute)
+        List<Reservation> due = ReservationDAO.getConfirmedReservationsStartingBetween(
+                Timestamp.valueOf(from), Timestamp.valueOf(to));
+        lastReminderWindowEnd = to;
 
-        // window around "reservation is in 2 hours"
-        LocalDateTime from = now.plusHours(2).minusMinutes(2);
-        LocalDateTime to = now.plusHours(2).plusMinutes(2);
+        for (Reservation r : due) {
 
-        for (Reservation r : all) {
+            if (!reminderSent.add(r.getReservationId())) continue; // already reminded in this run
 
-            // already reminded (in this server run)
-            if (reminderSent.contains(r.getReservationId())) continue;
-
-            if (!"CONFIRMED".equalsIgnoreCase(r.getStatus())) continue;
-
-            Timestamp ts = r.getReservationTime();
-            if (ts == null) continue;
-
-            LocalDateTime resTime = ts.toLocalDateTime();
-
-            if (resTime.isBefore(from) || resTime.isAfter(to)) continue;
+            LocalDateTime resTime = r.getReservationTime().toLocalDateTime();
 
             try {
                 String email = ReservationDAO.getReservationEmail(r.getReservationId());
@@ -282,9 +294,8 @@ public class BackgroundJobs {
                 String phone = ReservationDAO.getReservationPhone(r.getReservationId());
                 EmailService.smsStub(phone, "Reservation reminder in 2 hours | Code: " + r.getConfirmationCode());
 
-                reminderSent.add(r.getReservationId());
-
             } catch (Exception e) {
+                reminderSent.remove(r.getReservationId()); // allow a retry if lookup failed
                 System.out.println("[REMINDER] Failed for reservation " +
                         r.getReservationId() + ": " + e.getMessage());
             }

@@ -47,12 +47,12 @@ public class SceneManager {
             FXMLLoader loader = new FXMLLoader(SceneManager.class.getResource(fxmlPath));
             Parent root = loader.load();
 
-            // ✅ ADD THIS BLOCK (bind the active controller to the shared client)
+            // Bind the active controller to the shared client so it receives server messages
             Object controller = loader.getController();
             if (controller instanceof ClientUI ui) {
                 ClientSession.bindUI(ui);
             }
-            // ✅ END BLOCK
+
 
             stage.setTitle(title);
             stage.setScene(new Scene(root));

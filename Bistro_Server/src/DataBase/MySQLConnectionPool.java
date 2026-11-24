@@ -3,6 +3,10 @@ package DataBase;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.Iterator;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executors;
@@ -10,51 +14,51 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import Server.ServerConfig;
+
 /**
  * Singleton MySQL connection pool.
- * Reuses connections and periodically closes idle ones.
+ * Reuses connections, validates them before reuse and periodically closes idle ones.
+ * <p>
+ * DB settings come from {@code server.properties} in the working directory (git-ignored):
+ * {@code db.host, db.port, db.name, db.user, db.password}. There is intentionally no real
+ * password in the source code; see {@code deployment/linux/config/server.properties.example}.
  */
 public class MySQLConnectionPool {
 
-	// -------- DB CONFIG (loaded from server.properties if present) --------
-	private static final String DEFAULT_HOST = "localhost";
-	private static final String DEFAULT_PORT = "3306";
-	private static final String DEFAULT_DB   = "Bistro";
-	private static final String DEFAULT_USER = "CHANGE_ME";
-	private static final String DEFAULT_PASS = "CHANGE_ME";
-
+	// -------- DB CONFIG (from server.properties) --------
 	private static final String URL;
 	private static final String USER;
 	private static final String PASSWORD;
+	private static final String TIME_ZONE;
 
 	static {
-	    java.util.Properties p = new java.util.Properties();
+	    String host = ServerConfig.get("db.host", "localhost");
+	    String port = ServerConfig.get("db.port", "3306");
+	    String db   = ServerConfig.get("db.name", "Bistro");
 
-	    // Try to load server.properties from the current working directory (where you run the jar)
-	    try (java.io.InputStream in = new java.io.FileInputStream("server.properties")) {
-	        p.load(in);
-	    } catch (Exception ignored) {
-	        // No file? fine. We'll use defaults.
-	    }
-
-	    String host = p.getProperty("db.host", DEFAULT_HOST);
-	    String port = p.getProperty("db.port", DEFAULT_PORT);
-	    String db   = p.getProperty("db.name", DEFAULT_DB);
-
-	    USER = p.getProperty("db.user", DEFAULT_USER);
-	    PASSWORD = p.getProperty("db.password", DEFAULT_PASS);
+	    USER = ServerConfig.get("db.user", "CHANGE_ME");
+	    PASSWORD = ServerConfig.get("db.password", "CHANGE_ME");
+	    TIME_ZONE = ServerConfig.timeZoneId();
 
 	    URL = "jdbc:mysql://" + host + ":" + port + "/" + db
-	        + "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Jerusalem";
+	        + "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=" + TIME_ZONE;
+
+	    if ("CHANGE_ME".equals(USER)) {
+	        System.out.println("[DB] WARNING: db.user/db.password not set. Create server.properties "
+	                + "(see deployment/linux/config/server.properties.example).");
+	    }
 	}
 
     // ---------- POOL CONFIG ----------
-    /** Maximum number of pooled connections that can be cached. */
+    /** Maximum number of idle connections kept in the pool. */
     private static final int  MAX_POOL_SIZE      = 10;
     /** Idle timeout – how long a connection may sit unused before cleanup (ms). */
-    private static final long MAX_IDLE_MILLIS    = 30_000L;  // 30s idle timeout
+    private static final long MAX_IDLE_MILLIS    = 30_000L;
     /** How often the cleanup task runs (seconds). */
-    private static final long CLEANUP_PERIOD_SEC = 10L;      // run cleanup every 10s
+    private static final long CLEANUP_PERIOD_SEC = 10L;
+    /** Seconds to wait when validating a connection before reuse. */
+    private static final int  VALIDATE_TIMEOUT_SEC = 2;
 
     // ---------- SINGLETON INSTANCE ----------
     private static MySQLConnectionPool instance;
@@ -67,6 +71,14 @@ public class MySQLConnectionPool {
             instance = new MySQLConnectionPool();
         }
         return instance;
+    }
+
+    /** Shuts the pool down if it was ever created (safe to call on server exit). */
+    public static synchronized void shutdownIfCreated() {
+        if (instance != null) {
+            instance.shutdown();
+            instance = null;
+        }
     }
 
     // ---------- INTERNAL STATE ----------
@@ -82,7 +94,12 @@ public class MySQLConnectionPool {
     private MySQLConnectionPool() {
         pool = new LinkedBlockingQueue<>(MAX_POOL_SIZE);
 
-        cleaner = Executors.newSingleThreadScheduledExecutor();
+        // Daemon thread: the pool must never keep the JVM alive after the server window is closed
+        cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "DB-pool-cleaner");
+            t.setDaemon(true);
+            return t;
+        });
         cleaner.scheduleAtFixedRate(
                 this::cleanupIdleConnections,
                 CLEANUP_PERIOD_SEC,
@@ -92,47 +109,79 @@ public class MySQLConnectionPool {
     }
 
     /**
-     * Gets a pooled connection from the queue, or creates a new one if needed.
+     * Gets a pooled connection from the queue (after checking it is still alive),
+     * or creates a new one if needed.
      *
      * @return a PooledConnection ready to use (wrapped JDBC Connection)
      */
     public PooledConnection getConnection() {
-        // Try to reuse from queue
-        PooledConnection pConn = pool.poll();
-
-        if (pConn == null) {
-            // Queue empty -> create new physical connection
-            try {
-                Connection conn = DriverManager.getConnection(URL, USER, PASSWORD);
-                pConn = new PooledConnection(conn);
-            } catch (SQLException e) {
-                throw new RuntimeException("Failed to create DB connection", e);
+        PooledConnection pConn;
+        while ((pConn = pool.poll()) != null) {
+            if (isUsable(pConn)) {
+                pConn.touch();
+                return pConn;
             }
-        } else {
-            // Reusing existing connection – update last-used timestamp
-            pConn.touch();
+            pConn.closePhysicalConnection(); // dead (DB restart / network) -> drop it
         }
 
-        return pConn;
+        try {
+            Connection conn = DriverManager.getConnection(URL, USER, PASSWORD);
+            applySessionTimeZone(conn);
+            return new PooledConnection(conn);
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to create DB connection", e);
+        }
+    }
+
+    private static boolean isUsable(PooledConnection pConn) {
+        try {
+            Connection c = pConn.getConnection();
+            return !c.isClosed() && c.getAutoCommit() && c.isValid(VALIDATE_TIMEOUT_SEC);
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Makes MySQL's NOW()/CURDATE() use the restaurant time zone, the same zone as the JVM.
+     * An offset (e.g. +02:00) is used because named zones need MySQL's time zone tables.
+     * Connections are recycled every few seconds of idleness, so DST changes are picked up.
+     */
+    private static void applySessionTimeZone(Connection conn) {
+        try (Statement st = conn.createStatement()) {
+            ZoneOffset offset = ZoneId.of(TIME_ZONE).getRules().getOffset(Instant.now());
+            String id = offset.getId().equals("Z") ? "+00:00" : offset.getId();
+            st.execute("SET time_zone = '" + id + "'");
+        } catch (Exception e) {
+            System.out.println("[DB] Could not set session time zone: " + e.getMessage());
+        }
     }
 
     /**
      * Returns a pooled connection back to the pool.
-     * If the pool is already full, the underlying JDBC connection is closed.
+     * If the pool is already full, or the connection was left inside a transaction,
+     * the underlying JDBC connection is closed instead.
      */
-
     public void releaseConnection(PooledConnection pConn) {
         if (pConn == null) {
             return;
         }
 
-        // Mark as recently used before putting back in the pool
         pConn.touch();
 
-        boolean offered = pool.offer(pConn);
+        boolean offered = isReturnable(pConn) && pool.offer(pConn);
         if (!offered) {
-            // Pool is full -> close it instead of blocking
             pConn.closePhysicalConnection();
+        }
+    }
+
+    /** Cheap local check (no DB round trip): open and not left in the middle of a transaction. */
+    private static boolean isReturnable(PooledConnection pConn) {
+        try {
+            Connection c = pConn.getConnection();
+            return !c.isClosed() && c.getAutoCommit();
+        } catch (SQLException e) {
+            return false;
         }
     }
 
@@ -155,19 +204,12 @@ public class MySQLConnectionPool {
 
     /**
      * Shuts down the pool: stops the cleaner thread and closes all pooled connections.
-     * Optional – can be called when the server is shutting down.
      */
     public void shutdown() {
-        cleaner.shutdown();
-        for (PooledConnection pConn : pool) {
+        cleaner.shutdownNow();
+        PooledConnection pConn;
+        while ((pConn = pool.poll()) != null) {
             pConn.closePhysicalConnection();
         }
-        pool.clear();
     }
 }
-
-
-
-
-
-

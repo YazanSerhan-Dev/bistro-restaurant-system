@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.UUID;
 
 import DataBase.MySQLConnectionPool;
+import DataBase.PasswordHasher;
 import DataBase.PooledConnection;
 import common.dto.ProfileDTO;
 import common.dto.SubscriberDTO;
@@ -35,17 +36,20 @@ public class SubscriberDAO {
 	 * @param birthDate subscriber birth date (nullable)
 	 * @throws Exception on database error
 	 */
-    public static void insertSubscriber(
+    public static synchronized void insertSubscriber(
             String username, String password, String name,
             String phone, String email,
            Date birthDate) throws Exception {
-    	
-    	String memberCode = generateNextId("member_code", "MEM");
-        String barcode = generateNextId("barcode_data", "BAR");
+        // synchronized: generating the next member code + inserting must not interleave
+        // between two registrations, or both would get the same code.
 
-        // 2. If birthDate is missing from UI, default to today (prevents crash)
+        String memberCode = generateNextId("member_code", "MEM");
+        // The QR/barcode identifies the subscriber at the terminal, so it must NOT be guessable
+        // (sequential values like BAR1, BAR2 would let anyone impersonate any subscriber).
+        String barcode = "BAR-" + UUID.randomUUID().toString().replace("-", "").toUpperCase();
+
         if (birthDate == null) {
-            birthDate = new Date(System.currentTimeMillis());
+            throw new IllegalArgumentException("Birth date is required.");
         }
 
         String sql = """
@@ -61,7 +65,7 @@ public class SubscriberDAO {
 
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, username);
-            ps.setString(2, password);
+            ps.setString(2, PasswordHasher.hash(password)); // never store plain text
             ps.setString(3, name);
             ps.setString(4, phone);
             ps.setString(5, email);
@@ -120,21 +124,17 @@ public class SubscriberDAO {
         return prefix + (maxId + 1);
     }
 
-    // ============================================
-    // YOUR CODE (From HEAD) - Get List for Agent
-    // ============================================
- // In getAllSubscribers() method:
     /**
      * Retrieves all subscribers for staff/agent view.
      * <p>
-     * Returns basic subscriber details without sensitive data.
+     * Returns basic subscriber details without sensitive data (the password column is never read).
      *
      * @return list of subscribers
      * @throws Exception on database error
      */
     public static List<SubscriberDTO> getAllSubscribers() throws Exception {
         List<SubscriberDTO> list = new ArrayList<>();
-        String sql = "SELECT * FROM subscribers"; 
+        String sql = "SELECT username, name, phone, email, birth_date FROM subscribers ORDER BY username";
 
         MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
         PooledConnection pc = pool.getConnection();
@@ -162,11 +162,10 @@ public class SubscriberDAO {
         return list;
     }
 
-    // ============================================
-    // TEAMMATE'S CODE (From main) - Login Checks
-    // ============================================
     /**
-     * Validates subscriber login credentials.
+     * Validates subscriber login credentials against the salted password hash.
+     * <p>
+     * Old plain-text passwords still work once and are replaced by a hash on that successful login.
      *
      * @param username subscriber username
      * @param password subscriber password
@@ -174,29 +173,44 @@ public class SubscriberDAO {
      * @throws Exception on database error
      */
     public static boolean checkLogin(String username, String password) throws Exception {
-        String sql = "SELECT 1 FROM subscribers WHERE username=? AND password=? LIMIT 1";
+        String sql = "SELECT password FROM subscribers WHERE username=? LIMIT 1";
 
         MySQLConnectionPool pool = MySQLConnectionPool.getInstance();
         PooledConnection pc = pool.getConnection();
         Connection conn = pc.getConnection();
 
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, username);
-            ps.setString(2, password);
-
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
+        try {
+            String stored;
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, username);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return false;
+                    stored = rs.getString("password");
+                }
             }
+
+            if (!PasswordHasher.verify(password, stored)) return false;
+
+            if (PasswordHasher.needsUpgrade(stored)) {
+                try (PreparedStatement up = conn.prepareStatement(
+                        "UPDATE subscribers SET password=? WHERE username=? AND password=?")) {
+                    up.setString(1, PasswordHasher.hash(password));
+                    up.setString(2, username);
+                    up.setString(3, stored);
+                    up.executeUpdate();
+                }
+            }
+            return true;
         } finally {
             pool.releaseConnection(pc);
         }
     }
 
     /**
-     * Retrieves subscriber phone number by username.
+     * Retrieves subscriber email address by username.
      *
      * @param username subscriber username
-     * @return phone number or null if not found
+     * @return email or null if not found
      * @throws Exception on database error
      */
     public static String getEmailByUsername(String username) throws Exception {

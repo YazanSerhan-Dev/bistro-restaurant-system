@@ -85,4 +85,12 @@ public class WaitingListDTO implements Serializable {
     public String getRequestTime() { return requestTime; }
     /** Sets request time. */
     public void setRequestTime(String requestTime) { this.requestTime = requestTime; }
+
+    /** Table the customer was sent to right away (only when a table was free on joining), else null. */
+    private String tableId;
+
+    /** @return the table the customer was seated at immediately, or null if they are waiting */
+    public String getTableId() { return tableId; }
+    /** @param tableId table assigned immediately on joining */
+    public void setTableId(String tableId) { this.tableId = tableId; }
 }

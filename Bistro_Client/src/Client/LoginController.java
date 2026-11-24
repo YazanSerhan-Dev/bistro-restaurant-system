@@ -35,11 +35,21 @@ public class LoginController implements ClientUI {
      */
     @FXML
     public void initialize() {
-    	onConnected();
         lblMsg.setText("");
+
+        // Back on the login screen = nobody is logged in anymore (also clears staff/subscriber leftovers)
+        ClientSession.clearAllIdentity();
+        ClientSession.clearSubscriberContact();
 
         try {
             ClientSession.connect(this); // same shared connection for the whole app
+            BistroClient c = ClientSession.getClient();
+            if (c != null && c.isConnected()) {
+                onConnected();
+                // Reset the server-side session of this connection as well
+                c.sendToServer(new KryoMessage("ENVELOPE",
+                        KryoUtil.toBytes(Envelope.request(OpCode.REQUEST_LOGOUT, null))));
+            }
         } catch (Exception e) {
             lblConn.setText("Connection failed: " + e.getMessage());
         }

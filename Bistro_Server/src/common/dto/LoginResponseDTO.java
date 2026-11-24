@@ -82,5 +82,3 @@ public class LoginResponseDTO implements Serializable {
     }
 }
 
-
-

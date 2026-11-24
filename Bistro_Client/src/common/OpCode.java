@@ -157,6 +157,11 @@ public enum OpCode {
     REQUEST_REPORT_ACTIVITY,
     RESPONSE_REPORT_ACTIVITY,
     
-    REQUEST_PERFORMANCE_LOGS,  
+    REQUEST_PERFORMANCE_LOGS,
     RESPONSE_PERFORMANCE_LOGS,
+
+ // ===== Session =====
+    // Appended at the end on purpose: Kryo sends enums by ordinal, so new
+    // constants must always be added last (and identically in client + server).
+    REQUEST_LOGOUT,
 }

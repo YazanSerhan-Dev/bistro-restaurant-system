@@ -237,14 +237,6 @@ public class ClientSession {
         } catch (Exception ignored) {}
     }
     /**
-     * Clears stored guest customer identity information (email and phone).
-     */
-
-    public static void clearGuestIdentity() {
-        guestEmail = null;
-        guestPhone = null;
-    }
-    /**
      * Clears all stored session identity information, including role,
      * subscriber data, and guest contact details.
      */
@@ -255,6 +247,7 @@ public class ClientSession {
         guestEmail = null;
         guestPhone = null;
         memberCode = null;
+        clearSubscriberContact();
     }
 
 
