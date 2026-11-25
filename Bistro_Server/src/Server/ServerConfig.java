@@ -45,6 +45,17 @@ public final class ServerConfig {
         return (v == null || v.isBlank()) ? def : v.trim();
     }
 
+    public static int getInt(String key, int def) {
+        String v = PROPS.getProperty(key);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            System.out.println("[CONFIG] Invalid number for " + key + ": " + v + " (using " + def + ")");
+            return def;
+        }
+    }
+
     public static boolean getBoolean(String key, boolean def) {
         String v = PROPS.getProperty(key);
         return (v == null || v.isBlank()) ? def : Boolean.parseBoolean(v.trim());

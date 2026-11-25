@@ -1,0 +1,5 @@
+label,clients,confirmed_reservations,time_slots_checked,overbooking_violations
+before,10,0,0,0
+before,25,0,0,0
+before,50,0,0,0
+before,100,0,0,0

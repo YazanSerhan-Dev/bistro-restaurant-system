@@ -1,0 +1,5 @@
+label,clients,confirmed_reservations,time_slots_checked,overbooking_violations
+parallel,10,1540,616,0
+parallel,25,1548,624,0
+parallel,50,1547,621,0
+parallel,100,1524,615,0

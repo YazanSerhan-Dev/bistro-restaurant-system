@@ -1,0 +1,2 @@
+label,clients,confirmed_reservations,time_slots_checked,overbooking_violations
+after-burst,100,0,0,0

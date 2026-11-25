@@ -51,8 +51,12 @@ public class MySQLConnectionPool {
 	}
 
     // ---------- POOL CONFIG ----------
-    /** Maximum number of idle connections kept in the pool. */
-    private static final int  MAX_POOL_SIZE      = 10;
+    /**
+     * Maximum number of idle connections kept in the pool. Must be at least the number of server
+     * worker threads (requests now run in parallel), otherwise busy periods keep opening and closing
+     * physical MySQL connections. Configurable with db.pool.maxIdle.
+     */
+    private static final int  MAX_POOL_SIZE      = ServerConfig.getInt("db.pool.maxIdle", 50);
     /** Idle timeout – how long a connection may sit unused before cleanup (ms). */
     private static final long MAX_IDLE_MILLIS    = 30_000L;
     /** How often the cleanup task runs (seconds). */

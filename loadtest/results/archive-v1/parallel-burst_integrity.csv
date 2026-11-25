@@ -1,0 +1,5 @@
+label,clients,confirmed_reservations,time_slots_checked,overbooking_violations
+parallel-burst,10,1541,617,0
+parallel-burst,25,1539,627,0
+parallel-burst,50,1539,625,0
+parallel-burst,100,1529,619,0
