@@ -8,10 +8,13 @@ import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import ocsf.server.AbstractServer;
 import ocsf.server.ConnectionToClient;
@@ -162,11 +165,15 @@ public class BistroServer extends AbstractServer {
      * OCSF reads plain Java-serialized objects from every client socket. Without a filter, a malicious
      * client could send any Serializable class (a classic Java deserialization attack). Clients only
      * ever send KryoMessage(String, byte[]), so everything else is rejected.
+     * <p>
+     * Only per-object limits are used (maxdepth, maxarray). "maxrefs"/"maxbytes" must NOT be used:
+     * Java counts them over the whole lifetime of the stream, so a long-lived client connection was
+     * dropped after a few hundred requests (found by the load test).
      */
     static {
         try {
             ObjectInputFilter.Config.setSerialFilter(ObjectInputFilter.Config.createFilter(
-                    "maxdepth=5;maxrefs=1000;maxbytes=10485760;maxarray=10485760;"
+                    "maxdepth=5;maxarray=10485760;"
                     + "common.KryoMessage;java.lang.String;!*"));
         } catch (IllegalStateException alreadySet) {
             // a filter was already installed for this JVM
@@ -182,6 +189,88 @@ public class BistroServer extends AbstractServer {
     public BistroServer(int port, ServerController controller) {
         super(port);
         this.controller = controller;
+
+        // OCSF's default listen backlog is 10: a burst of connections beyond that was refused by the OS
+        // (load test: only 24 of 100 simultaneous clients could connect). Let bursts queue instead.
+        setBacklog(ServerConfig.getInt("server.backlog", 200));
+
+        // server.workers = 0 keeps the original OCSF behaviour (one request at a time, inside the lock);
+        // used by the load test to measure "before" and "after" with the same code.
+        int threads = ServerConfig.getInt("server.workers",
+                Math.max(8, Math.min(32, Runtime.getRuntime().availableProcessors() * 2)));
+        this.workers = (threads <= 0) ? null : Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "bistro-worker");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    // ==================== Parallel request handling ====================
+    //
+    // OCSF calls handleMessageFromClient() from a *synchronized* method, so the server used to process
+    // ONE request at a time for all clients (load test: flat ~350 req/s, latency growing with every
+    // client). Now handleMessageFromClient() only queues the request and returns at once; a worker pool
+    // runs requests from different clients in parallel, while each client's own requests still run
+    // one after another in the order they were sent (same behaviour the client code relies on).
+
+    /** Worker threads that run the request handlers (null = legacy single-threaded mode). */
+    private final ExecutorService workers;
+
+    private static final String S_QUEUE = "session.queue";
+
+    /** Runs one client's requests in order, on the shared worker pool. */
+    private static final class ClientQueue {
+        private final ExecutorService pool;
+        private final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
+        private boolean running = false;
+
+        ClientQueue(ExecutorService pool) { this.pool = pool; }
+
+        synchronized void submit(Runnable task) {
+            tasks.add(task);
+            if (!running) {
+                running = true;
+                pool.execute(this::drain);
+            }
+        }
+
+        private void drain() {
+            while (true) {
+                Runnable next;
+                synchronized (this) {
+                    next = tasks.poll();
+                    if (next == null) { running = false; return; }
+                }
+                try {
+                    next.run();
+                } catch (Throwable t) {
+                    System.out.println("[WORKER] Unhandled error: " + t);
+                }
+            }
+        }
+    }
+
+    /**
+     * Called by OCSF (inside its global lock): only hand the request to this client's queue.
+     */
+    @Override
+    protected void handleMessageFromClient(Object msg, ConnectionToClient client) {
+        ClientQueue q = (ClientQueue) client.getInfo(S_QUEUE);
+        if (workers == null || q == null || workers.isShutdown()) {
+            processMessage(msg, client); // legacy mode or shutting down: handle inline
+            return;
+        }
+        try {
+            q.submit(() -> processMessage(msg, client));
+        } catch (java.util.concurrent.RejectedExecutionException shuttingDown) {
+            // pool closed during shutdown: drop the request
+        }
+    }
+
+    /** Stops the worker pool when the server is closed. */
+    @Override
+    protected void serverClosed() {
+        if (workers != null) workers.shutdown();
     }
     /**
      * Writes a log line either to the UI (if available) or to console.
@@ -268,12 +357,33 @@ public class BistroServer extends AbstractServer {
     @Override
     protected void clientConnected(ConnectionToClient client) {
         super.clientConnected(client);
-        String host = host(client);
         String ip = ip(client);
-        log("Client connected: " + host + " (" + ip + ")");
-        client.setInfo("host", host);
+
+        // All per-connection keys are created here, once, before any worker touches them
+        // (later setInfo() calls only replace values, they never change the map's structure).
         client.setInfo("ip", ip);
-        if (controller != null) controller.onClientConnected(host, ip);
+        client.setInfo("host", ip);
+        setSession(client, null, null, null);
+
+        // The host name needs a reverse-DNS lookup, which can take seconds on a LAN. This method runs
+        // while OCSF holds its global lock, so the lookup is done on a worker thread instead.
+        Runnable announce = () -> {
+            String host = host(client);
+            client.setInfo("host", host);
+            log("Client connected: " + host + " (" + ip + ")");
+            if (controller != null) controller.onClientConnected(host, ip);
+        };
+
+        if (workers == null) { // legacy single-threaded mode
+            announce.run();
+            return;
+        }
+        client.setInfo(S_QUEUE, new ClientQueue(workers));
+        try {
+            workers.execute(announce);
+        } catch (java.util.concurrent.RejectedExecutionException shuttingDown) {
+            // server is closing
+        }
     }
     /**
      * Called when a client disconnects normally.
@@ -309,13 +419,13 @@ public class BistroServer extends AbstractServer {
     }
 
     /**
-     * Main message handler. Decodes request into {@link Envelope} and routes by {@link OpCode}.
+     * Main message handler (runs on a worker thread). Decodes the request into {@link Envelope},
+     * checks authorization and routes it by {@link OpCode}.
      *
      * @param msg    incoming object from client (usually {@link KryoMessage} or {@link Envelope})
      * @param client client connection
      */
-    @Override
-    protected void handleMessageFromClient(Object msg, ConnectionToClient client) {
+    private void processMessage(Object msg, ConnectionToClient client) {
         try {
             Envelope req = unwrapToEnvelope(msg);
             if (req == null || req.getOp() == null) {

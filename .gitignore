@@ -16,3 +16,5 @@ wifi.h
 
 # MQTT (Paho) file persistence folder (the server now uses in-memory persistence)
 bistro-server-tcp*/
+# load test working files (build output, server logs, generated server.properties with credentials)
+loadtest/.run/
